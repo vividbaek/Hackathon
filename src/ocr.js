@@ -2,12 +2,20 @@ import Tesseract from 'tesseract.js';
 import { spawn } from 'node:child_process';
 import * as processor from './utils/image-processor.js';
 import sharp from 'sharp';
-import { writeFile, unlink, mkdir } from 'node:fs/promises';
+import { writeFile, unlink, mkdir, readFile } from 'node:fs/promises';
 import path, { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { readFile } from 'node:fs/promises';
 import { detectAndDecodeQR } from './utils/qr-processor.js';
-import * as pdfjs from 'pdfjs-dist';
+
+import pkgCanvas from 'canvas';
+const { createCanvas, DOMMatrix } = pkgCanvas;
+
+// Polyfills for Node.js
+if (typeof global.DOMMatrix === 'undefined') {
+  global.DOMMatrix = DOMMatrix;
+}
+
+import * as pdfjs from 'pdfjs-dist/legacy/build/pdf.mjs';
 
 /**
  * Tesseract Engine Implementation
@@ -114,7 +122,7 @@ export async function scanStandardized(inputSource, targetWidth = 2000, options 
   const cellH = Math.floor(metadata.height / rows);
 
   const sourceLabel = Buffer.isBuffer(inputSource) ? 'Buffer' : inputSource;
-  console.log(`Processing ${sourceLabel} with standardized pipeline...`);
+  console.error(`Processing ${sourceLabel} with standardized pipeline...`);
   
   // Decide which versions of the image to scan (Multi-pass Attack Detection)
   const buffersToScan = [
@@ -122,7 +130,7 @@ export async function scanStandardized(inputSource, targetWidth = 2000, options 
   ];
 
   // --- Attack Detection Passes ---
-  console.log('Running Attack Detection Passes...');
+  console.error('Running Attack Detection Passes...');
   
   // Pass 1: Extreme Contrast & Gamma (Low-contrast hidden text)
   const extreme = await processor.applyExtremeContrast(normalizedBuffer);
@@ -149,7 +157,7 @@ export async function scanStandardized(inputSource, targetWidth = 2000, options 
   qrAttacks.push(...mainQr.map(q => ({ ...q, source: 'qr_main' })));
 
   for (const { buffer, label } of buffersToScan) {
-    console.log(` -> Processing [${label}] version...`);
+    console.error(` -> Processing [${label}] version...`);
     const isExtreme = ['extreme_contrast', 'high_clahe', 'edge_detect', 'low_threshold'].includes(label);
     
     // Scan whole image
@@ -321,7 +329,7 @@ export async function scanStandardized(inputSource, targetWidth = 2000, options 
  * Self-Test to verify Tesseract is working
  */
 async function runSelfTest() {
-  console.log('Running OCR Self-Test...');
+  console.error('Running OCR Self-Test...');
   try {
     const blank = await sharp({
       create: { width: 200, height: 100, channels: 3, background: { r: 255, g: 255, b: 255 } }
@@ -331,7 +339,7 @@ async function runSelfTest() {
     const result = await worker.recognize(blank, {}, { blocks: true });
     await worker.terminate();
     
-    console.log('Self-Test Result: Engine is alive');
+    console.error('Self-Test Result: Engine is alive');
     return true;
   } catch (err) {
     console.error('Self-Test FAILED:', err);
@@ -343,7 +351,7 @@ async function runSelfTest() {
 if (process.argv[1].endsWith('ocr.js')) {
   const filePath = process.argv[2];
   if (!filePath) {
-    console.log('Usage: node src/ocr.js <image_or_pdf_path>');
+    console.error('Usage: node src/ocr.js <image_or_pdf_path>');
     process.exit(1);
   }
 
@@ -354,7 +362,7 @@ if (process.argv[1].endsWith('ocr.js')) {
     
     // Handle PDF by converting first page to image
     if (filePath.toLowerCase().endsWith('.pdf')) {
-      console.log(`📄 PDF detected: ${filePath}. Extracting first page...`);
+      console.error(`📄 PDF detected: ${filePath}. Extracting first page...`);
       try {
         const data = new Uint8Array(await readFile(filePath));
         const loadingTask = pdfjs.getDocument({ data, verbosity: 0 });
@@ -363,7 +371,7 @@ if (process.argv[1].endsWith('ocr.js')) {
         const viewport = page.getViewport({ scale: 2.0 });
         
         // We use canvas to render the PDF page to a buffer
-        const canvas = (await import('canvas')).default.createCanvas(viewport.width, viewport.height);
+        const canvas = createCanvas(viewport.width, viewport.height);
         const context = canvas.getContext('2d');
         
         await page.render({
@@ -378,52 +386,37 @@ if (process.argv[1].endsWith('ocr.js')) {
       }
     }
 
-    scanStandardized(inputSource).then(data => {
-      console.log('\n' + '='.repeat(50));
-      console.log('📊 OCR ANALYSIS REPORT');
-      console.log('='.repeat(50));
-      console.log(`Resolution: ${data.resolution.width}x${data.resolution.height}`);
-      
-      console.log('\n[1] NORMAL VISIBLE TEXT:');
-      if (data.normalWords.length === 0) console.log(' (None)');
-      data.normalWords.forEach(w => {
-        if (w.conf > 60) console.log(` - ${w.text} (${w.conf}%) [source: ${w.source}]`);
-      });
-
-      console.log('\n' + '!'.repeat(50));
-      console.log('🚨 HIDDEN ATTACK DETECTION (Risk Score >= 85)');
-      console.log('!'.repeat(50));
-      
-      if (data.hiddenAttacks.length === 0) {
-        console.log(' ✅ No high-risk hidden text or QR attacks detected.');
-      } else {
-        data.hiddenAttacks.forEach(line => {
-          const typeLabel = line.type === 'qr_code' ? `[QR: ${line.category}]` : '[HIDDEN TEXT]';
-          console.log(` [Score: ${line.score}] 🚩 ${typeLabel} "${line.text}"`);
-          console.log(`    -> Sources: ${line.sources.join(', ')}`);
-          console.log(`    -> Location: x:${line.x}, y:${line.y}, h:${line.h}`);
-          if (line.type !== 'qr_code') {
-            console.log(`    -> Confidence: ${Math.round(line.avgConf)}%\n`);
-          } else {
-            console.log('');
-          }
-        });
-      }
-      console.log('!'.repeat(50) + '\n');
-
+    scanStandardized(inputSource).then(async data => {
       // Visualization (Only for Scored Attacks)
       const outputDir = 'examples/detected';
-      const fileName = path.basename(imgPath, path.extname(imgPath));
+      const fileName = path.basename(filePath, path.extname(filePath));
       const outputPath = path.join(outputDir, `${fileName}_detected.png`);
 
-      mkdir(outputDir, { recursive: true })
-        .then(() => processor.drawBoundingBoxes(imgPath, data.hiddenAttacks))
-        .then(vizBuffer => writeFile(outputPath, vizBuffer))
-        .then(() => console.log(`✅ Visualized result saved to: ${outputPath}`))
-        .catch(err => console.error('Failed to save visualization:', err));
+      await mkdir(outputDir, { recursive: true });
+      const vizBuffer = await processor.drawBoundingBoxes(inputSource, data.hiddenAttacks);
+      await writeFile(outputPath, vizBuffer);
+
+      // Construct JSON Output
+      const resultJson = {
+        source: filePath,
+        resolution: `${data.resolution.width}x${data.resolution.height}`,
+        visualized_result: outputPath,
+        visible_text: data.normalWords.map(w => w.text).join(' '),
+        detected_attacks: data.hiddenAttacks.map(attack => ({
+          type: attack.type,
+          category: attack.category || 'hidden_text',
+          text: attack.text,
+          score: attack.score,
+          location: { x: attack.x, y: attack.y, w: attack.w, h: attack.h },
+          sources: attack.sources
+        }))
+      };
+
+      // Print only JSON to stdout
+      console.log(JSON.stringify(resultJson, null, 2));
 
     }).catch(err => {
-      console.error('Pipeline failed:', err);
+      console.error(JSON.stringify({ error: 'Pipeline failed', details: err.message }, null, 2));
     });
   });
 }
