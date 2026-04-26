@@ -1,14 +1,16 @@
 #!/usr/bin/env node
+import { readFile } from 'node:fs/promises';
 import { applyCompanyProfile, loadConfig } from './config.js';
 import { mergeReports, scanText } from './policy/engine.js';
 import { encodeImageFile, createVisionProviderFromConfig } from './providers/vision-llm.js';
+import { normalizePreprocessedImageResult } from './vision.js';
 import { highestSeverity } from './policy/severity.js';
 import { runGuardedCommand } from './runner.js';
 import { createAgentHandoff, saveAgentHandoff, pipeToAgent } from './harness.js';
 import { runTower } from './tower.js';
 import { guardAndRecord, recordReport } from './guard.js';
 import { startPolicyServer } from './server.js';
-import { createExecEvent, createOpenEvent } from './integrations/os-guard.js';
+import { createExecEvent, createOpenEvent, createUnlinkEvent } from './integrations/os-guard.js';
 import { fetchDaemonStatus, findProcessIdsByNames, registerPidWithDaemon } from './integrations/es-daemon.js';
 import {
   analyze as analyzeLearn,
@@ -29,6 +31,7 @@ Usage:
   404gent scan-output <text>
   404gent scan-image <vlm-or-ocr-text>
   404gent scan-image --file <image-path>
+  404gent scan-image --preprocessed <json-path>
   404gent scan-llm <text>
   404gent agent --role <qa|backend|security> -- <task>
   404gent pipe --role <from> --to <to> -- <output-text>
@@ -37,6 +40,7 @@ Usage:
   404gent os-guard status
   404gent os-guard simulate-open <path> [--agent name] [--pid pid]
   404gent os-guard simulate-exec <command...> [--agent name] [--pid pid]
+  404gent os-guard simulate-unlink <path> [--agent name] [--pid pid]
   404gent os-guard register-existing [--names codex,claude,gemini,opencode]
   404gent learn status
   404gent learn analyze
@@ -52,6 +56,8 @@ Usage:
 Options:
   --config <path>   Load a JSON config file.
   --file <path>     Image file path for scan-image (enables Claude Vision analysis).
+  --preprocessed <path>
+                    Preprocessed image JSON for scan-image.
   --role <role>     Agent harness role. Defaults to qa.
   --company <id>    Company profile id for agent handoff metadata.
   --json            Print machine-readable JSON.
@@ -68,6 +74,7 @@ function parseArgs(argv) {
     json: false,
     configPath: undefined,
     filePath: undefined,
+    preprocessedPath: undefined,
     role: 'qa',
     to: undefined,
     companyId: undefined,
@@ -95,6 +102,8 @@ function parseArgs(argv) {
       options.configPath = args.shift();
     } else if (arg === '--file') {
       options.filePath = args.shift();
+    } else if (arg === '--preprocessed') {
+      options.preprocessedPath = args.shift();
     } else if (arg === '--role') {
       options.role = args.shift() ?? 'qa';
     } else if (arg === '--to') {
@@ -292,6 +301,18 @@ export async function main(argv = process.argv.slice(2)) {
     return 2;
   }
 
+  if (surface === 'image' && options.preprocessedPath) {
+    const raw = await readFile(options.preprocessedPath, 'utf8');
+    const preprocessed = JSON.parse(raw);
+    const event = normalizePreprocessedImageResult(preprocessed, {
+      preprocessedPath: options.preprocessedPath,
+      pathBase: config.dataDir ?? '.404gent'
+    });
+    const result = await guardAndRecord(event, config);
+    printResult(result, options.json);
+    return result.decision === 'block' ? 1 : 0;
+  }
+
   // Vision analysis path: actual image file via Claude Vision API
   if (surface === 'image' && options.filePath) {
     const encoded = await encodeImageFile(options.filePath);
@@ -375,6 +396,21 @@ async function handleOsGuardCommand({ argv, options, config }) {
       return 2;
     }
     const result = await guardAndRecord(createExecEvent(command, {
+      agent: options.agent,
+      pid: options.pid,
+      mode: 'simulate'
+    }), config);
+    printResult(result, options.json);
+    return result.decision === 'block' ? 1 : 0;
+  }
+
+  if (subcommand === 'simulate-unlink') {
+    const path = argv[1];
+    if (!path) {
+      console.error('simulate-unlink requires a path.');
+      return 2;
+    }
+    const result = await guardAndRecord(createUnlinkEvent(path, {
       agent: options.agent,
       pid: options.pid,
       mode: 'simulate'

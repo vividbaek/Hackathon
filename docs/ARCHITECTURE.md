@@ -165,6 +165,41 @@ mode: enforce (기본)    → severity가 high/critical이면 block, 아니면 w
 └──────────────────────┘
 ```
 
+전처리 팀이 이미지 분석을 별도 단계에서 수행하는 경우 `image_preprocess_v1` JSON을 `scan-image --preprocessed`로 주입합니다. MVP에서는 이미지를 base64로 넣지 않고 `.404gent/` 기준 상대 경로만 사용합니다.
+
+```
+.404gent/
+├── images/raw/{timestamp}_{id}.png
+├── images/normalized/{timestamp}_{id}.normalized.png
+└── preprocessed/{timestamp}_{id}.json
+```
+
+```json
+{
+  "schemaVersion": "image_preprocess_v1",
+  "imageId": "20260426_103000_abc123",
+  "sourceImagePath": "images/raw/20260426_103000_abc123.png",
+  "normalizedImagePath": "images/normalized/20260426_103000_abc123.normalized.png",
+  "detections": [
+    {
+      "id": "det-1",
+      "kind": "hidden_text",
+      "severityHint": "critical",
+      "text": "hidden instruction text",
+      "extractedValue": "decoded payload",
+      "bbox": { "x": 0.1, "y": 0.2, "width": 0.3, "height": 0.05 },
+      "confidence": 0.91
+    }
+  ]
+}
+```
+
+```
+node src/cli.js scan-image --preprocessed .404gent/preprocessed/20260426_103000_abc123.json
+```
+
+Policy Server는 `.404gent/images/` 아래 파일을 `/images/...`로 서빙하므로 dashboard와 리뷰 UI가 원본/정규화 이미지를 같은 상대 경로 규칙으로 참조할 수 있습니다.
+
 ### 3. Runner (`src/runner.js`)
 
 셸 명령을 가드레일로 감싸서 실행합니다.

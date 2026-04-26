@@ -11,7 +11,7 @@ public struct EventHandler {
     await client.handleOpen(path: path, pid: pid, agent: agent)
   }
 
-  public func handleExec(argv: [String], pid: Int32, agent: String? = nil) async {
-    await client.handleExec(argv: argv, pid: pid, agent: agent)
+  public func handleExec(argv: [String], pid: Int32, parentPid: Int32? = nil, agent: String? = nil) async {
+    await client.handleExec(argv: argv, pid: pid, parentPid: parentPid, agent: agent)
   }
 }

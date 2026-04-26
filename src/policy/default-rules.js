@@ -170,6 +170,24 @@ export const defaultRules = [
     remediation: remediation.os
   },
   {
+    id: 'os-sensitive-file-unlink',
+    appliesTo: ['os'],
+    severity: 'critical',
+    category: 'sensitive_file_delete',
+    pattern: '\\bos\\s+unlink\\b[^\\n]*(?:path="?[^"\\s]*(?:\\.env(?:\\.(?:local|production|development))?|credentials\\.json|secrets\\.json|\\.npmrc|\\.pypirc|\\.netrc|\\.kube/config)|/(?:\\.ssh|\\.aws|\\.gnupg)/)',
+    rationale: 'OS Guard simulation observed deletion of a file that commonly contains credentials.',
+    remediation: remediation.os
+  },
+  {
+    id: 'os-destructive-unlink',
+    appliesTo: ['os'],
+    severity: 'high',
+    category: 'destructive_file_delete',
+    pattern: '\\bos\\s+unlink\\b[^\\n]*(?:path="?[^"\\s]*(?:/Desktop/|/Documents/|/Downloads/|/workspace/|/src/|/\\.git/))',
+    rationale: 'OS Guard simulation observed deletion in a high-impact project or user data path.',
+    remediation: remediation.os
+  },
+  {
     id: 'prompt-injection-english',
     appliesTo: ['prompt'],
     severity: 'high',

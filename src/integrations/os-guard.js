@@ -57,6 +57,25 @@ export function createExecEvent(argv, options = {}) {
   };
 }
 
+export function createUnlinkEvent(path, options = {}) {
+  const agent = options.agent ? String(options.agent) : undefined;
+  const mode = options.mode ?? 'simulate';
+  const meta = {
+    operation: 'unlink',
+    path: String(path ?? ''),
+    agent,
+    pid: options.pid === undefined ? undefined : Number(options.pid),
+    mode
+  };
+
+  return {
+    type: 'os',
+    text: `os unlink path=${quoteValue(meta.path)} pid=${meta.pid ?? ''} agent=${agent ?? ''} mode=${mode}`,
+    source: eventSource(agent),
+    meta
+  };
+}
+
 export function createOsEventFromPayload(payload = {}) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     throw new Error('OS event payload must be a JSON object.');
@@ -86,6 +105,17 @@ export function createOsEventFromPayload(payload = {}) {
       pid: payload.pid,
       mode: payload.mode ?? 'native-notify',
       executable: payload.executable
+    });
+  }
+
+  if (payload.type === 'unlink') {
+    if (typeof payload.path !== 'string' || payload.path.trim() === '') {
+      throw new Error('OS unlink event requires a non-empty path string.');
+    }
+    return createUnlinkEvent(payload.path, {
+      agent: payload.agent,
+      pid: payload.pid,
+      mode: payload.mode ?? 'simulate'
     });
   }
 

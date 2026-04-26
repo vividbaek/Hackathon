@@ -1,4 +1,6 @@
 import { createServer } from 'node:http';
+import { readFile } from 'node:fs/promises';
+import { extname, resolve, sep } from 'node:path';
 import { loadConfig } from './config.js';
 import { guardAndRecord } from './guard.js';
 import { createOsEventFromPayload } from './integrations/os-guard.js';
@@ -23,6 +25,37 @@ function sendJson(response, status, body) {
   response.end(JSON.stringify(body));
 }
 
+function imageContentType(path) {
+  return {
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.gif': 'image/gif',
+    '.webp': 'image/webp',
+    '.svg': 'image/svg+xml'
+  }[extname(path).toLowerCase()] ?? 'application/octet-stream';
+}
+
+function resolveImagePath(url, config = {}) {
+  const root = resolve(config.dataDir ?? '.404gent', 'images');
+  const relative = decodeURIComponent(url.pathname.replace(/^\/images\/?/, ''));
+  const target = resolve(root, relative);
+  if (target !== root && !target.startsWith(`${root}${sep}`)) {
+    throw new Error('Image path escapes data directory.');
+  }
+  return target;
+}
+
+async function sendImage(requestUrl, response, config = {}) {
+  const path = resolveImagePath(requestUrl, config);
+  const body = await readFile(path);
+  response.writeHead(200, {
+    'content-type': imageContentType(path),
+    'cache-control': 'no-store'
+  });
+  response.end(body);
+}
+
 export function createPolicyServer({ config } = {}) {
   return createServer(async (request, response) => {
     try {
@@ -30,6 +63,11 @@ export function createPolicyServer({ config } = {}) {
 
       if (request.method === 'GET' && url.pathname === '/health') {
         sendJson(response, 200, { ok: true });
+        return;
+      }
+
+      if (request.method === 'GET' && url.pathname.startsWith('/images/')) {
+        await sendImage(url, response, config);
         return;
       }
 
