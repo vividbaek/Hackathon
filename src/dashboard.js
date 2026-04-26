@@ -1956,7 +1956,7 @@ async function loadImageGallery(){
             '<div class="ig-info">'+
               '<div class="ig-verdict unscanned">⏳ 미분석 이미지</div>'+
               '<div style="font-size:11px;color:var(--muted);">아직 보안 스캔이 수행되지 않았습니다.</div>'+
-              '<button class="ig-scan-btn" onclick="scanExistingImage(this,\''+h(img.imageId)+'\')">스캔 시작</button>'+
+              '<button class="ig-scan-btn" onclick="scanExistingImage(this,\\x27'+h(img.imageId)+'\\x27)">스캔 시작</button>'+
             '</div>'+
           '</div></div>';
       }
