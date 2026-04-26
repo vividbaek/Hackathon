@@ -756,6 +756,28 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
 .afc-col{cursor:pointer;transition:transform .1s,box-shadow .15s;}
 .afc-col:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,.08);}
 .afc-mini-stats{display:flex;gap:8px;font-size:11px;font-weight:800;margin-top:4px;}
+
+/* ── 히스토리 에이전트 3분할 ── */
+.hist-agent-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;}
+@media(max-width:1000px){.hist-agent-grid{grid-template-columns:1fr;}}
+.hist-agent-col{background:var(--panel);border:1px solid var(--border);border-radius:var(--r);overflow:hidden;display:flex;flex-direction:column;}
+.hist-agent-col.has-block{border-color:#fca5a5;}
+.hist-agent-col.has-warn{border-color:#fcd34d;}
+.hac-header{padding:12px 14px;border-bottom:1px solid var(--border);background:var(--bg);display:flex;align-items:center;gap:10px;}
+.hac-icon{font-size:22px;}
+.hac-info{flex:1;}
+.hac-name{font-size:13px;font-weight:800;}
+.hac-sub{font-size:10px;color:var(--muted);}
+.hac-stats{display:flex;gap:6px;align-items:center;}
+.hac-stat{text-align:center;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:800;line-height:1.3;}
+.hac-stat.block{background:#fef2f2;color:var(--block);}.hac-stat.warn{background:#fffbeb;color:var(--warn);}.hac-stat.allow{background:#f0fdf4;color:var(--allow);}
+.hac-stat-n{font-size:16px;display:block;}
+.hac-body{flex:1;overflow-y:auto;max-height:500px;padding:6px;}
+.hac-body .tl-row{margin-bottom:4px;}
+.hac-empty{padding:32px 16px;text-align:center;color:var(--muted);font-size:12px;}
+.hac-footer{padding:8px 14px;border-top:1px solid var(--border);text-align:center;}
+.hac-footer button{border:none;background:none;color:var(--accent);font-size:11px;font-weight:700;cursor:pointer;font-family:inherit;padding:4px 8px;border-radius:4px;}
+.hac-footer button:hover{background:#eef2ff;}
 </style>
 </head>
 <body>
@@ -1098,6 +1120,50 @@ function renderAgentSummaryHeader(agentId,events){
     '<div class="has-rate"><div class="has-rate-val" style="color:'+(bk>0?'var(--block)':'var(--allow)')+'">'+rate+'%</div><div class="has-rate-lbl">차단율</div></div>';
 }
 
+function renderEventRow(e,now){
+  const d=e.decision||'allow',s=surf(e);
+  const aid=e.event?.agentId??'';
+  const aLbl=AGENT_LABEL[aid]??aid;
+  const agentBdg=aid?'<span class="badge badge-agent" title="'+h(aid)+'">'+h(aLbl)+'</span>':'';
+  const recent=d==='block'&&(now-Date.parse(e.timestamp??''))<30000;
+  const txt=(e.event?.text??e.text??'').slice(0,100);
+  const findings=e.findings??[];
+  const topSev=findings[0]?.severity;
+  const sevBdg=topSev&&d==='block'?sevPill(topSev):'';
+  const hPrompts=e.event?.evidence?.hiddenPrompts??[];
+  const fRows=findings.map(f=>'<div class="tl-finding">'+sevPill(f.severity)+'<strong>'+h(f.id)+'</strong><span style="color:var(--muted);">'+h(f.rationale||'')+'</span></div>').join('');
+  const injSec=hPrompts.length?'<div class="tl-inject"><strong>숨겨진 프롬프트 원문 ('+hPrompts.length+'건)</strong>'+hPrompts.map(p=>'<code>'+h(p)+'</code>').join('<br>')+'</div>':'';
+  return '<div class="tl-row '+d+(recent?' recent':'')+'"><div class="tl-head"><span class="tl-ts">'+fmt(e.timestamp??e.recordedAt)+'</span><span class="tl-dec '+d+'">'+ST_LABEL[d]+'</span>'+sevBdg+bdg(s)+agentBdg+'<span class="tl-txt"><code>'+h(txt)+'</code></span><span class="tl-cnt">발견 '+findings.length+'건</span></div><div class="tl-detail"><div class="tl-detail-hd"><strong>이벤트 ID:</strong> '+h(e.id||'—')+' · <strong>에이전트:</strong> '+h(aid||'—')+' · <strong>시각:</strong> '+fmtFull(e.timestamp)+(e.event?.evidence?.imagePath?' · <strong>이미지:</strong> '+h(e.event.evidence.imagePath):'')+'</div>'+(fRows?'<div class="finding-list">'+fRows+'</div>':'')+injSec+'</div></div>';
+}
+
+function renderAgentColumn(agentId,events,now,maxRows){
+  const role=agentId.replace('agent-','');
+  const m=ROLE_META[role]||{icon:'🤖',label:agentId,sub:''};
+  const ae=events.filter(e=>(e.event?.agentId??'')===agentId);
+  const bk=ae.filter(e=>e.decision==='block').length;
+  const wn=ae.filter(e=>e.decision==='warn').length;
+  const al=ae.filter(e=>e.decision==='allow').length;
+  const borderCls=bk>0?'has-block':wn>0?'has-warn':'';
+  const shown=ae.slice(0,maxRows||15);
+  const rowsHtml=shown.length
+    ?shown.map(e=>renderEventRow(e,now)).join('')
+    :'<div class="hac-empty">이 에이전트의 이벤트가 없습니다.</div>';
+  const moreBtn=ae.length>shown.length
+    ?'<div class="hac-footer"><button onclick="document.querySelectorAll(\'[data-agent=&quot;'+agentId+'&quot;]\').forEach(b=>b.click())">+'+( ae.length-shown.length)+'건 더 보기</button></div>':'';
+  return '<div class="hist-agent-col '+borderCls+'">'+
+    '<div class="hac-header">'+
+      '<span class="hac-icon">'+m.icon+'</span>'+
+      '<div class="hac-info"><div class="hac-name">'+h(m.label)+'</div><div class="hac-sub">'+h(m.sub)+'</div></div>'+
+      '<div class="hac-stats">'+
+        (bk?'<div class="hac-stat block"><span class="hac-stat-n">'+bk+'</span>차단</div>':'')+
+        (wn?'<div class="hac-stat warn"><span class="hac-stat-n">'+wn+'</span>경고</div>':'')+
+        '<div class="hac-stat allow"><span class="hac-stat-n">'+al+'</span>허용</div>'+
+      '</div>'+
+    '</div>'+
+    '<div class="hac-body">'+rowsHtml+'</div>'+moreBtn+
+  '</div>';
+}
+
 function renderHistory(model){
   const events=model.events||[];
   const fd=document.getElementById('f-dec').value;
@@ -1105,13 +1171,36 @@ function renderHistory(model){
   const fa=document.getElementById('f-agent').value||historyAgentFilter;
   const now=Date.now();
 
-  renderAgentSummaryHeader(fa,events);
+  const preFiltered=events.filter(e=>(!fd||e.decision===fd)&&(!fs||surf(e)===fs));
 
-  const filtered=events.filter(e=>(!fd||e.decision===fd)&&(!fs||surf(e)===fs)&&(!fa||(e.event?.agentId??'')===fa));
+  // ── 전체 모드: 에이전트 3분할 컬럼 ──
+  if(!fa){
+    renderAgentSummaryHeader('',events);
+    document.getElementById('hist-count').textContent='총 '+preFiltered.length+'건';
+    const agents=['agent-qa','agent-backend','agent-security'];
+    const unassigned=preFiltered.filter(e=>!agents.includes(e.event?.agentId??''));
+    let html='<div class="hist-agent-grid">'+
+      agents.map(aid=>renderAgentColumn(aid,preFiltered,now,15)).join('')+
+    '</div>';
+    if(unassigned.length){
+      html+='<div style="margin-top:16px;"><div class="tl-group-header"><span>미분류 이벤트</span><span>'+unassigned.length+'건</span></div>';
+      html+=unassigned.map(e=>renderEventRow(e,now)).join('');
+      html+='</div>';
+    }
+    if(!preFiltered.length){
+      html='<div style="text-align:center;padding:48px;color:var(--muted);font-size:13px;">조건에 맞는 이벤트가 없습니다.</div>';
+    }
+    document.getElementById('hist-list').innerHTML=html;
+    return;
+  }
+
+  // ── 특정 에이전트 모드: 요약 헤더 + 시간 그룹 리스트 ──
+  renderAgentSummaryHeader(fa,events);
+  const filtered=preFiltered.filter(e=>(e.event?.agentId??'')===fa);
   document.getElementById('hist-count').textContent='총 '+filtered.length+'건';
 
   if(!filtered.length){
-    document.getElementById('hist-list').innerHTML='<div style="text-align:center;padding:48px;color:var(--muted);font-size:13px;">조건에 맞는 이벤트가 없습니다.</div>';
+    document.getElementById('hist-list').innerHTML='<div style="text-align:center;padding:48px;color:var(--muted);font-size:13px;">이 에이전트의 이벤트가 없습니다.</div>';
     return;
   }
 
@@ -1125,21 +1214,7 @@ function renderHistory(model){
       (gBlocks?'<span class="tl-group-blocks">'+gBlocks+' 차단</span>':'')+
       (gWarns?'<span class="tl-group-warns">'+gWarns+' 경고</span>':'')+
     '</div>';
-    for(const e of g.events){
-      const d=e.decision||'allow',s=surf(e);
-      const aid=e.event?.agentId??'';
-      const aLbl=AGENT_LABEL[aid]??aid;
-      const agentBdg=aid?'<span class="badge badge-agent" title="'+h(aid)+'">'+h(aLbl)+'</span>':'';
-      const recent=d==='block'&&(now-Date.parse(e.timestamp??''))<30000;
-      const txt=(e.event?.text??e.text??'').slice(0,100);
-      const findings=e.findings??[];
-      const topSev=findings[0]?.severity;
-      const sevBdg=topSev&&d==='block'?sevPill(topSev):'';
-      const hPrompts=e.event?.evidence?.hiddenPrompts??[];
-      const fRows=findings.map(f=>'<div class="tl-finding">'+sevPill(f.severity)+'<strong>'+h(f.id)+'</strong><span style="color:var(--muted);">'+h(f.rationale||'')+'</span></div>').join('');
-      const injSec=hPrompts.length?'<div class="tl-inject"><strong>숨겨진 프롬프트 원문 ('+hPrompts.length+'건)</strong>'+hPrompts.map(p=>'<code>'+h(p)+'</code>').join('<br>')+'</div>':'';
-      html+='<div class="tl-row '+d+(recent?' recent':'')+'"><div class="tl-head"><span class="tl-ts">'+fmt(e.timestamp??e.recordedAt)+'</span><span class="tl-dec '+d+'">'+ST_LABEL[d]+'</span>'+sevBdg+bdg(s)+agentBdg+'<span class="tl-txt"><code>'+h(txt)+'</code></span><span class="tl-cnt">발견 '+findings.length+'건</span></div><div class="tl-detail"><div class="tl-detail-hd"><strong>이벤트 ID:</strong> '+h(e.id||'—')+' · <strong>에이전트:</strong> '+h(aid||'—')+' · <strong>시각:</strong> '+fmtFull(e.timestamp)+(e.event?.evidence?.imagePath?' · <strong>이미지:</strong> '+h(e.event.evidence.imagePath):'')+'</div>'+(fRows?'<div class="finding-list">'+fRows+'</div>':'')+injSec+'</div></div>';
-    }
+    for(const e of g.events){ html+=renderEventRow(e,now); }
   }
   document.getElementById('hist-list').innerHTML=html;
 }
