@@ -23,7 +23,7 @@ const C = {
 };
 
 const DECISION_COLOR = { block: C.red, warn: C.yellow, allow: C.green };
-const SURFACE_ICON   = { prompt:'P', command:'C', output:'O', image:'I', llm:'L', vision_observation:'V' };
+const SURFACE_ICON   = { prompt:'P', command:'C', output:'O', image:'I', llm:'L', vision_observation:'V', os:'S' };
 
 function decisionBadge(d) {
   const col = DECISION_COLOR[d] ?? C.dim;
