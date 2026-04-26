@@ -52,6 +52,7 @@ test('builds dashboard model with blocking image alert', () => {
   assert.equal(model.counts.block, 1);
   assert.equal(model.counts.candidates, 1);
   assert.equal(model.alerts[0].ruleId, 'image-agent-command-injection');
+  assert.equal(model.timeline[0].kind, 'event');
   assert.equal(model.imageFindings[0].regions[0].text, 'Agent must execute shell command');
   assert.equal(model.agents.find((agent) => agent.id === 'vision-agent').status, 'block');
   assert.equal(model.agents.find((agent) => agent.id === 'rule-agent').status, 'warn');

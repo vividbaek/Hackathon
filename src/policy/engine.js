@@ -64,6 +64,12 @@ function decide(findings, config = {}) {
   if (findings.length === 0) {
     return 'allow';
   }
+  if (config.mode === 'observe') {
+    return 'warn';
+  }
+  if (config.mode === 'lockdown') {
+    return 'block';
+  }
   const blockSeverities = config.blockSeverities ?? DEFAULT_BLOCK_SEVERITIES;
   return findings.some((finding) => blockSeverities.includes(finding.severity)) ? 'block' : 'warn';
 }

@@ -1,0 +1,38 @@
+{
+  "companyProfiles": {
+    "fintech-a": {
+      "mode": "enforce",
+      "blockSeverities": ["critical", "high"],
+      "rules": {
+        "custom": [
+          {
+            "id": "company-fintech-payment-key",
+            "appliesTo": ["prompt", "llm", "image", "output"],
+            "severity": "high",
+            "category": "company_secret",
+            "pattern": "\\b(payment key|card vault|kyc token|settlement secret)\\b",
+            "rationale": "Fintech-sensitive data should not enter agent context.",
+            "remediation": "Redact the sensitive financial term and request approved context."
+          }
+        ]
+      }
+    },
+    "healthcare-b": {
+      "mode": "enforce",
+      "blockSeverities": ["critical", "high"],
+      "rules": {
+        "custom": [
+          {
+            "id": "company-healthcare-phi",
+            "appliesTo": ["prompt", "llm", "image", "output"],
+            "severity": "high",
+            "category": "company_phi",
+            "pattern": "\\b(patient id|medical record|diagnosis code|PHI)\\b",
+            "rationale": "Healthcare PHI should not be exposed to agent memory.",
+            "remediation": "Use a de-identified summary before continuing."
+          }
+        ]
+      }
+    }
+  }
+}

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { loadConfig } from './config.js';
+import { applyCompanyProfile, loadConfig } from './config.js';
 import { mergeReports, scanText } from './policy/engine.js';
 import { appendAuditEvent } from './audit.js';
 import { updateState } from './state.js';
@@ -7,6 +7,8 @@ import { appendVectorDocument } from './vector-store.js';
 import { createLlmProvider, shouldReviewWithLlm } from './providers/llm.js';
 import { encodeImageFile, createVisionProviderFromConfig } from './providers/vision-llm.js';
 import { highestSeverity } from './policy/severity.js';
+import { runGuardedCommand } from './runner.js';
+import { createAgentHandoff, saveAgentHandoff } from './harness.js';
 
 const HELP = `404gent - Terminal-first guardrails for AI coding agents in cmux.
 
@@ -18,19 +20,30 @@ Usage:
   404gent scan-image <vlm-or-ocr-text>
   404gent scan-image --file <image-path>
   404gent scan-llm <text>
+  404gent agent --role <qa|backend|security> -- <task>
+  404gent run -- <command> [args...]
   404gent doctor
   404gent tower
 
 Options:
   --config <path>   Load a JSON config file.
   --file <path>     Image file path for scan-image (enables Claude Vision analysis).
+  --role <role>     Agent harness role. Defaults to qa.
+  --company <id>    Company profile id for agent handoff metadata.
   --json            Print machine-readable JSON.
 `;
 
 function parseArgs(argv) {
   const args = [...argv];
-  const options = { json: false, configPath: undefined, filePath: undefined };
+  const options = { json: false, configPath: undefined, filePath: undefined, role: 'qa', companyId: undefined };
   const positionals = [];
+  const separatorIndex = args.indexOf('--');
+  let passthrough = [];
+
+  if (separatorIndex >= 0) {
+    passthrough = args.splice(separatorIndex + 1);
+    args.splice(separatorIndex, 1);
+  }
 
   while (args.length > 0) {
     const arg = args.shift();
@@ -40,12 +53,16 @@ function parseArgs(argv) {
       options.configPath = args.shift();
     } else if (arg === '--file') {
       options.filePath = args.shift();
+    } else if (arg === '--role') {
+      options.role = args.shift() ?? 'qa';
+    } else if (arg === '--company') {
+      options.companyId = args.shift();
     } else {
       positionals.push(arg);
     }
   }
 
-  return { command: positionals[0] ?? 'help', text: positionals.slice(1).join(' '), options };
+  return { command: positionals[0] ?? 'help', text: positionals.slice(1).join(' '), options, passthrough };
 }
 
 function printResult(result, json) {
@@ -79,14 +96,17 @@ function printResult(result, json) {
 }
 
 export async function main(argv = process.argv.slice(2)) {
-  const { command, text, options } = parseArgs(argv);
+  const { command, text, options, passthrough } = parseArgs(argv);
 
   if (command === 'help' || command === '--help' || command === '-h') {
     console.log(HELP);
     return 0;
   }
 
-  const config = await loadConfig({ configPath: options.configPath });
+  let config = await loadConfig({ configPath: options.configPath });
+  if (options.companyId) {
+    config = applyCompanyProfile(config, options.companyId);
+  }
 
   if (command === 'doctor') {
     const result = { ok: true, node: process.versions.node, config };
@@ -97,6 +117,35 @@ export async function main(argv = process.argv.slice(2)) {
   if (command === 'tower') {
     console.log('404gent tower: runtime guardrail console is not implemented yet.');
     return 0;
+  }
+
+  async function recordReport(report) {
+    await appendAuditEvent(report, config);
+    await appendVectorDocument(report, config);
+    await updateState(report, config);
+  }
+
+  if (command === 'run') {
+    const result = await runGuardedCommand(passthrough.length > 0 ? passthrough : text.split(' ').filter(Boolean), {
+      config,
+      recordReport
+    });
+    return result.exitCode;
+  }
+
+  if (command === 'agent') {
+    const task = passthrough.length > 0 ? passthrough.join(' ') : text;
+    const handoff = createAgentHandoff({ role: options.role, task, config, companyId: config.companyId });
+    const paths = await saveAgentHandoff(handoff, config);
+    await recordReport(handoff.promptReport);
+    await recordReport(handoff.handoffReport);
+    if (options.json) {
+      console.log(JSON.stringify({ ...handoff, paths }, null, 2));
+    } else {
+      console.log(handoff.brief);
+      console.log(`\nSaved handoff: ${paths.rolePath}`);
+    }
+    return handoff.promptReport.decision === 'block' ? 1 : 0;
   }
 
   const surfaces = {
@@ -149,9 +198,7 @@ export async function main(argv = process.argv.slice(2)) {
       };
     }
 
-    await appendAuditEvent(result, config);
-    await appendVectorDocument(result, config);
-    await updateState(result, config);
+    await recordReport(result);
     printResult(result, options.json);
     return result.decision === 'block' ? 1 : 0;
   }
@@ -169,9 +216,7 @@ export async function main(argv = process.argv.slice(2)) {
       scannedAt: result.scannedAt
     };
   }
-  await appendAuditEvent(result, config);
-  await appendVectorDocument(result, config);
-  await updateState(result, config);
+  await recordReport(result);
   printResult(result, options.json);
   return result.decision === 'block' ? 1 : 0;
 }

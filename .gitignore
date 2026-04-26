@@ -1,3 +1,5 @@
 .404gent/
+.claude/settings.local.json
+.claude/*.bak.*
 node_modules/
 npm-debug.log*
