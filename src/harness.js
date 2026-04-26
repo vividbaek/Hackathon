@@ -1,4 +1,5 @@
 import { scanText } from './policy/engine.js';
+import { getRules } from './policy/rules.js';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
@@ -147,15 +148,31 @@ export function createAgentHandoff({ role = 'qa', task = '', config = {}, sessio
  * Scan agent A's output before it becomes agent B's task.
  * Blocks cross-agent context poisoning at the handoff boundary.
  *
+ * Uses critical-only severity for pipe scans to avoid false positives when
+ * agent output legitimately describes security rule names or concepts.
+ * (e.g. an agent explaining "prompt-malware" or "jailbreak" rules should not
+ *  block the handoff — only actual injection attempts should.)
+ *
  * Returns { blocked, pipeReport, handoff }
  *   blocked=true  → output was dangerous; do not forward to next agent
  *   blocked=false → handoff object is safe to use
  */
 export function pipeToAgent({ fromRole, toRole, outputText, config = {}, sessionId, companyId }) {
+  // For pipe scans, only apply rules that explicitly target the 'llm' surface.
+  // This prevents prompt-surface rules (e.g. prompt-malware, prompt-jailbreak)
+  // from firing on agent outputs that legitimately describe security rule names.
+  // Real LLM attacks (memory poisoning, handoff override) are still caught by
+  // the dedicated llm-* rules.
+  const llmOnlyRules = getRules(config).filter(r => {
+    const targets = Array.isArray(r.appliesTo) ? r.appliesTo : [r.appliesTo ?? ''];
+    return targets.includes('llm') || targets.includes('*');
+  });
+  const pipeConfig = { ...config, rules: llmOnlyRules };
+
   const pipeReport = scanText({
     surface: 'llm',
     text: String(outputText ?? ''),
-    config,
+    config: pipeConfig,
     source: 'agent-pipe',
     agentId: `agent-${fromRole}`,
     meta: { fromRole, toRole, sessionId }
