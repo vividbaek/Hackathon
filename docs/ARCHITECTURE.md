@@ -198,6 +198,13 @@ mode: enforce (기본)    → severity가 high/critical이면 block, 아니면 w
 node src/cli.js scan-image --preprocessed .404gent/preprocessed/20260426_103000_abc123.json
 ```
 
+로컬 OCR 전처리까지 404gent에서 수행하려면 raw 이미지를 `preprocess-image`에 넣습니다. 이 명령은 `src/ocr.js`와 `src/utils/image-processor.js`를 사용해 raw/normalized 이미지와 `image_preprocess_v1` JSON을 생성합니다.
+
+```
+node src/cli.js preprocess-image captures/dashboard.png
+node src/cli.js scan-image --preprocessed .404gent/preprocessed/<generated-id>.json
+```
+
 Policy Server는 `.404gent/images/` 아래 파일을 `/images/...`로 서빙하므로 dashboard와 리뷰 UI가 원본/정규화 이미지를 같은 상대 경로 규칙으로 참조할 수 있습니다.
 
 ### 3. Runner (`src/runner.js`)

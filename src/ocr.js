@@ -93,6 +93,7 @@ async function recognizeWithEasyOcr(buffer, cropInfo) {
  * Main Standardized Pipeline
  */
 export async function scanStandardized(inputPath, targetWidth = 2000, options = { invert: true }) {
+  const quiet = Boolean(options.quiet);
   // 1. Create a normalized master buffer
   const normalizedBuffer = await sharp(inputPath, { density: 300 })
     .resize({ width: targetWidth })
@@ -102,13 +103,15 @@ export async function scanStandardized(inputPath, targetWidth = 2000, options = 
 
   const metadata = await sharp(normalizedBuffer).metadata();
   const rows = 2, cols = 2, factor = 2;
-  const gridCrops = await processor.gridScaleUp(normalizedBuffer, rows, cols, factor, targetWidth);
+  const gridCrops = await processor.gridScaleUp(normalizedBuffer, rows, cols, factor, targetWidth, { quiet });
   
   const allResults = [];
   const cellW = Math.floor(metadata.width / cols);
   const cellH = Math.floor(metadata.height / rows);
 
-  console.log(`Processing ${inputPath} with standardized pipeline...`);
+  if (!quiet) {
+    console.log(`Processing ${inputPath} with standardized pipeline...`);
+  }
   
   // Decide which versions of the image to scan (Multi-pass Attack Detection)
   const buffersToScan = [
@@ -116,7 +119,9 @@ export async function scanStandardized(inputPath, targetWidth = 2000, options = 
   ];
 
   // --- Attack Detection Passes ---
-  console.log('Running Attack Detection Passes...');
+  if (!quiet) {
+    console.log('Running Attack Detection Passes...');
+  }
   
   // Pass 1: Extreme Contrast & Gamma (Low-contrast hidden text)
   const extreme = await processor.applyExtremeContrast(normalizedBuffer);
@@ -138,7 +143,9 @@ export async function scanStandardized(inputPath, targetWidth = 2000, options = 
   const extremeResults = [];
 
   for (const { buffer, label } of buffersToScan) {
-    console.log(` -> Processing [${label}] version...`);
+    if (!quiet) {
+      console.log(` -> Processing [${label}] version...`);
+    }
     const isExtreme = ['extreme_contrast', 'high_clahe', 'edge_detect', 'low_threshold'].includes(label);
     
     // Scan whole image
@@ -194,6 +201,7 @@ export async function scanStandardized(inputPath, targetWidth = 2000, options = 
 
   return {
     resolution: { width: metadata.width, height: metadata.height },
+    normalizedBuffer,
     normalWords: cleanNormal,
     hiddenWords: hiddenText
   };
