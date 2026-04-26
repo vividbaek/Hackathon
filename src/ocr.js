@@ -106,6 +106,38 @@ async function recognizeWithEasyOcr(buffer, cropInfo) {
 /**
  * Main Standardized Pipeline
  */
+/**
+ * Helper to group words into natural lines/sentences
+ */
+function groupIntoLines(words) {
+  if (!words || words.length === 0) return "";
+  
+  // Sort by Y first, then X
+  const sorted = [...words].sort((a, b) => (a.bbox.y - b.bbox.y) || (a.bbox.x - b.bbox.x));
+  
+  const lines = [];
+  let currentLine = [sorted[0]];
+  
+  for (let i = 1; i < sorted.length; i++) {
+    const last = currentLine[currentLine.length - 1];
+    const curr = sorted[i];
+    
+    const yDiff = Math.abs(curr.bbox.y - last.bbox.y);
+    const xDist = curr.bbox.x - (last.bbox.x + last.bbox.w);
+    
+    // If y-difference is small and x-distance is reasonable, same line
+    if (yDiff < 15 && xDist < 60) {
+      currentLine.push(curr);
+    } else {
+      lines.push(currentLine.map(w => w.text).join(' '));
+      currentLine = [curr];
+    }
+  }
+  lines.push(currentLine.map(w => w.text).join(' '));
+  
+  return lines.join(' ');
+}
+
 export async function scanStandardized(inputSource, targetWidth = 2000, options = { invert: true }) {
   // 1. Create a normalized master buffer
   const normalizedBuffer = await sharp(inputSource, { density: 300 })
@@ -232,6 +264,8 @@ export async function scanStandardized(inputSource, targetWidth = 2000, options 
   const cleanNormal = deduplicate(normalResults);
   const cleanExtreme = deduplicate(extremeResults);
 
+  const fullVisibleText = groupIntoLines(cleanNormal);
+
   // --- 1. Score All Detected Lines (Visible + Hidden) ---
   const allWordGroups = [];
   
@@ -306,8 +340,21 @@ export async function scanStandardized(inputSource, targetWidth = 2000, options 
     if (avgConf < 50) score -= 25;
 
     // Content analysis (The most important factor)
-    const containsAttack = /http|https|\.com|\.test|\.sh|curl|bash|admin|root|override|inject|exploit|powershell|cmd|eval/i.test(text);
-    if (containsAttack) score += 70; // Massive bonus for attack content
+    // Expanded regex to catch more attack patterns and leetspeak (at1acker, p4ssword, etc.)
+    const attackPatterns = [
+      /http|https|\.com|\.test|\.sh|curl|bash|powershell|cmd|eval/i,
+      /admin|root|override|inject|exploit|payload|bypass/i,
+      /transfer|funds|account|bank|credit|payment|invoice/i,
+      /token|password|secret|key|credential|login|auth/i,
+      /leak|exfil|upload|download|stolen|hacked/i,
+      /at[10]acker|p[4@][s5]{2}word|0verr[1i]de/i // Leetspeak patterns
+    ];
+
+    const containsAttack = attackPatterns.some(p => p.test(text));
+    const hasSensitiveData = /([a-z0-9_-]+[:=][a-z0-9_-]+)/i.test(text) || /[0-9]{10,}/.test(text);
+
+    if (containsAttack) score += 90; // Even higher bonus for attack content
+    if (hasSensitiveData) score += 20; // Bonus for key=value or long number patterns
     
     if (/[A-Z]{3,}/.test(text)) score += 10;
     if (/=|:|\[|\]|\/|\.|\-/.test(text)) score += 10;
@@ -328,7 +375,7 @@ export async function scanStandardized(inputSource, targetWidth = 2000, options 
   });
 
   // Strict Threshold: Only high confidence attacks
-  const filteredAttacks = scoredLines.filter(line => line.score >= 85);
+  const filteredAttacks = scoredLines.filter(line => line.score >= 80);
 
   // --- 3. Merge QR Attacks ---
   const finalAttacks = [
@@ -343,6 +390,7 @@ export async function scanStandardized(inputSource, targetWidth = 2000, options 
   return {
     resolution: { width: metadata.width, height: metadata.height },
     normalWords: cleanNormal,
+    visibleText: fullVisibleText,
     hiddenAttacks: finalAttacks.sort((a, b) => b.score - a.score)
   };
 }
@@ -382,63 +430,78 @@ if (process.argv[1].endsWith('ocr.js')) {
     
     let inputSource = filePath;
     
-    // Handle PDF by converting first page to image
+    // Handle PDF by converting ALL pages to images
     if (filePath.toLowerCase().endsWith('.pdf')) {
-      console.error(`📄 PDF detected: ${filePath}. Extracting first page...`);
+      console.error(`📄 PDF detected: ${filePath}. Processing all pages...`);
       try {
         const data = new Uint8Array(await readFile(filePath));
         const loadingTask = pdfjs.getDocument({ data, verbosity: 0 });
         const pdf = await loadingTask.promise;
-        const page = await pdf.getPage(1);
-        const viewport = page.getViewport({ scale: 2.0 });
-        
-        const canvas = createCanvas(viewport.width, viewport.height);
-        const context = canvas.getContext('2d');
-        
-        await page.render({
-          canvasContext: context,
-          viewport: viewport,
-          intent: 'print'
-        }).promise;
-        
-        inputSource = canvas.toBuffer('image/png');
+        const numPages = pdf.numPages;
+
+        for (let i = 1; i <= numPages; i++) {
+          console.error(`  -> Processing page ${i}/${numPages}...`);
+          const page = await pdf.getPage(i);
+          const viewport = page.getViewport({ scale: 2.0 });
+          const canvas = createCanvas(viewport.width, viewport.height);
+          const context = canvas.getContext('2d');
+
+          // Render with 'print' intent to catch hidden layers/annotations
+          await page.render({
+            canvasContext: context,
+            viewport: viewport,
+            intent: 'print'
+          }).promise;
+
+          const pageBuffer = canvas.toBuffer('image/png');
+          await runPipelineForSource(pageBuffer, filePath, i);
+        }
       } catch (err) {
         console.error('Failed to process PDF:', err);
         process.exit(1);
       }
+    } else {
+      await runPipelineForSource(filePath, filePath, null);
     }
-
-    scanStandardized(inputSource).then(async data => {
-      // Visualization (Only for Scored Attacks)
-      const outputDir = 'examples/detected';
-      const fileName = path.basename(filePath, path.extname(filePath));
-      const outputPath = path.join(outputDir, `${fileName}_detected.png`);
-
-      await mkdir(outputDir, { recursive: true });
-      const vizBuffer = await processor.drawBoundingBoxes(inputSource, data.hiddenAttacks);
-      await writeFile(outputPath, vizBuffer);
-
-      // Construct JSON Output
-      const resultJson = {
-        source: filePath,
-        resolution: `${data.resolution.width}x${data.resolution.height}`,
-        visualized_result: outputPath,
-        visible_text: data.visibleText,
-        detected_attacks: data.hiddenAttacks.map(attack => ({
-          type: attack.type,
-          category: attack.category || 'hidden_text',
-          text: attack.text,
-          score: attack.score,
-          location: { x: attack.x, y: attack.y, w: attack.w, h: attack.h },
-          sources: attack.sources
-        }))
-      };
-
-      // Print only JSON to stdout
-      console.log(JSON.stringify(resultJson, null, 2));
-
-    }).catch(err => {
-      console.error(JSON.stringify({ error: 'Pipeline failed', details: err.message }, null, 2));
-    });
   });
+}
+
+/**
+ * Encapsulated Pipeline for a single image source
+ */
+async function runPipelineForSource(source, originalPath, pageNum) {
+  try {
+    const data = await scanStandardized(source);
+    
+    // Visualization
+    const outputDir = 'examples/detected';
+    const fileName = path.basename(originalPath, path.extname(originalPath));
+    const suffix = pageNum ? `_p${pageNum}_detected.png` : '_detected.png';
+    const outputPath = path.join(outputDir, `${fileName}${suffix}`);
+
+    await mkdir(outputDir, { recursive: true });
+    const vizBuffer = await processor.drawBoundingBoxes(source, data.hiddenAttacks);
+    await writeFile(outputPath, vizBuffer);
+
+    // JSON Output
+    const resultJson = {
+      source: originalPath,
+      page: pageNum || 1,
+      resolution: `${data.resolution.width}x${data.resolution.height}`,
+      visualized_result: outputPath,
+      visible_text: data.visibleText,
+      detected_attacks: data.hiddenAttacks.map(attack => ({
+        type: attack.type,
+        category: attack.category || 'hidden_text',
+        text: attack.text,
+        score: attack.score,
+        location: { x: attack.x, y: attack.y, w: attack.w, h: attack.h },
+        sources: attack.sources
+      }))
+    };
+
+    console.log(JSON.stringify(resultJson, null, 2));
+  } catch (err) {
+    console.error(JSON.stringify({ error: 'Pipeline failed', details: err.message }, null, 2));
+  }
 }
