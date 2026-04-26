@@ -26,6 +26,78 @@ export const defaultRules = [
     remediation: 'Do not pass this visual instruction into the agent context; log the source image and extracted text.'
   },
   {
+    id: 'image-inject-command',
+    appliesTo: ['image', 'vision_observation'],
+    severity: 'critical',
+    category: 'visual_command_injection',
+    pattern: '\\b(?:inject|execute|run|eval)[_\\s-]*(?:command|cmd|code|script|shell)\\b',
+    rationale: 'Image text contains command injection directives.',
+    remediation: 'Quarantine the image and do not pass extracted text to any agent or shell.'
+  },
+  {
+    id: 'image-security-override',
+    appliesTo: ['image', 'vision_observation'],
+    severity: 'critical',
+    category: 'visual_security_tampering',
+    pattern: '(?:security[_\\s-]*protocol[_\\s-]*(?:=\\s*)?off|admin[_\\s-]*override|disable[_\\s-]*(?:security|firewall|guard|auth))',
+    rationale: 'Image text attempts to disable security controls or override admin protections.',
+    remediation: 'Do not process this image instruction; log it as a security tampering attempt.'
+  },
+  {
+    id: 'image-hidden-curl-wget',
+    appliesTo: ['image', 'vision_observation'],
+    severity: 'critical',
+    category: 'visual_remote_execution',
+    pattern: '\\b(?:curl|wget)\\b.{0,200}(?:attacker|exploit|malware|evil|hack|c2|beacon|reverse|payload|exfil)',
+    rationale: 'Image text contains network download commands targeting a suspicious endpoint.',
+    remediation: 'Block this image from agent processing and preserve as forensic evidence.'
+  },
+  {
+    id: 'image-terminal-bypass',
+    appliesTo: ['image', 'vision_observation'],
+    severity: 'critical',
+    category: 'visual_destructive_command',
+    pattern: '(?:terminal[_\\s-]*bypass|rm\\s+-rf|format\\s+c:|del\\s+/[sfq]|no-preserve-root)',
+    rationale: 'Image text contains destructive terminal commands or bypass instructions.',
+    remediation: 'Do not execute any commands derived from this image.'
+  },
+  {
+    id: 'image-override-instruction',
+    appliesTo: ['image', 'vision_observation'],
+    severity: 'critical',
+    category: 'visual_prompt_injection',
+    pattern: '\\b(?:override|bypass|ignore|disregard|forget)\\b.{0,120}\\b(?:instruction|rule|policy|protocol|security|system|guard|filter)\\b',
+    rationale: 'Image text attempts to override security instructions or policies.',
+    remediation: 'Block this image from agent processing; the embedded text is a prompt injection attempt.'
+  },
+  {
+    id: 'image-shell-command',
+    appliesTo: ['image', 'vision_observation'],
+    severity: 'critical',
+    category: 'visual_command_injection',
+    pattern: '\\b(?:curl|wget|bash|sh|python|ruby|perl|nc|netcat|ncat)\\b.{0,80}\\b(?:-[sOoeLfk]|http|ftp|tcp|udp|/dev/|pipe|exec|eval)\\b',
+    rationale: 'Image text contains shell command patterns that could be used for remote code execution.',
+    remediation: 'Do not execute any commands extracted from this image.'
+  },
+  {
+    id: 'image-exfiltrate-secrets',
+    appliesTo: ['image', 'vision_observation'],
+    severity: 'critical',
+    category: 'visual_secret_exfiltration',
+    pattern: '\\b(?:exfiltrate|steal|extract|dump|leak|harvest)\\b.{0,120}\\b(?:key|token|secret|password|credential|api[_\\s-]*key|env|ssh|private)\\b',
+    rationale: 'Image text instructs exfiltration of sensitive credentials.',
+    remediation: 'Block and quarantine; preserve image as forensic evidence.'
+  },
+  {
+    id: 'image-new-instruction',
+    appliesTo: ['image', 'vision_observation'],
+    severity: 'high',
+    category: 'visual_prompt_injection',
+    pattern: '\\b(?:new instruction|you are now|act as|system:|from now on|forget everything|ignore above)\\b',
+    rationale: 'Image text contains prompt injection patterns attempting to change agent behavior.',
+    remediation: 'Do not process this image as agent input; flag as visual prompt injection.'
+  },
+  {
     id: 'image-qr-exfiltration-hint',
     appliesTo: ['image', 'vision_observation'],
     severity: 'high',

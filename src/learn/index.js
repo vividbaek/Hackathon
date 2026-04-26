@@ -97,6 +97,12 @@ export async function analyze(config = {}, { manual = false, windowMinutes } = {
     source: paths.attackLogs,
     candidates: proposals.map(candidateFor)
   });
+  await writeJson(paths.learnState, {
+    lastAnalyzedAt: output.generatedAt,
+    attackCount: attacks.count,
+    proposed: proposals.length,
+    inference
+  });
 
   return {
     ok: true,
