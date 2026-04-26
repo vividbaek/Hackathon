@@ -32,6 +32,7 @@ export function normalizeVisionObservation(observation = {}) {
       imagePath: observation.imagePath,
       imageUrl: observation.imageUrl,
       extractedText,
+      regions: observation.regions ?? [],
       visualSignals: observation.visualSignals ?? [],
       confidence: observation.confidence
     },
