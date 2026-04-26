@@ -17,6 +17,9 @@ if (typeof global.DOMMatrix === 'undefined') {
 
 import * as pdfjs from 'pdfjs-dist/legacy/build/pdf.mjs';
 
+// Node.js worker setup
+pdfjs.GlobalWorkerOptions.workerSrc = path.resolve('./node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs');
+
 /**
  * Tesseract Engine Implementation
  */
@@ -236,7 +239,10 @@ export async function scanStandardized(inputSource, targetWidth = 2000, options 
   const cleanNormal = deduplicate(normalResults);
   const cleanExtreme = deduplicate(extremeResults);
 
-  // Find "Hidden" text candidate words
+  // --- 1. Score All Detected Lines (Visible + Hidden) ---
+  const allWordGroups = [];
+  
+  // Group Hidden Candidate Words
   const hiddenCandidateWords = cleanExtreme.filter(ext => {
     const isFoundInNormal = cleanNormal.some(norm => {
       const textMatch = norm.text.trim().toLowerCase() === ext.text.trim().toLowerCase();
@@ -246,8 +252,6 @@ export async function scanStandardized(inputSource, targetWidth = 2000, options 
     return !isFoundInNormal;
   });
 
-  // --- 1. Group Hidden Words into Lines/Sentences ---
-  const groups = [];
   if (hiddenCandidateWords.length > 0) {
     const sorted = [...hiddenCandidateWords].sort((a, b) => (a.bbox.y - b.bbox.y) || (a.bbox.x - b.bbox.x));
     let currentGroup = [sorted[0]];
@@ -257,13 +261,28 @@ export async function scanStandardized(inputSource, targetWidth = 2000, options 
       const yDiff = Math.abs(curr.bbox.y - last.bbox.y);
       const xDist = curr.bbox.x - (last.bbox.x + last.bbox.w);
       if (yDiff < 15 && xDist < 60) currentGroup.push(curr);
-      else { groups.push(currentGroup); currentGroup = [curr]; }
+      else { allWordGroups.push({ group: currentGroup, isHidden: true }); currentGroup = [curr]; }
     }
-    groups.push(currentGroup);
+    allWordGroups.push({ group: currentGroup, isHidden: true });
   }
 
-  // --- 2. Score Each Line ---
-  const scoredLines = groups.map(group => {
+  // Group Normal Words for Scoring
+  if (cleanNormal.length > 0) {
+    const sorted = [...cleanNormal].sort((a, b) => (a.bbox.y - b.bbox.y) || (a.bbox.x - b.bbox.x));
+    let currentGroup = [sorted[0]];
+    for (let i = 1; i < sorted.length; i++) {
+      const last = currentGroup[currentGroup.length - 1];
+      const curr = sorted[i];
+      const yDiff = Math.abs(curr.bbox.y - last.bbox.y);
+      const xDist = curr.bbox.x - (last.bbox.x + last.bbox.w);
+      if (yDiff < 15 && xDist < 60) currentGroup.push(curr);
+      else { allWordGroups.push({ group: currentGroup, isHidden: false }); currentGroup = [curr]; }
+    }
+    allWordGroups.push({ group: currentGroup, isHidden: false });
+  }
+
+  // --- 2. Score Each Group ---
+  const scoredLines = allWordGroups.map(({ group, isHidden }) => {
     const minX = Math.min(...group.map(w => w.bbox.x));
     const minY = Math.min(...group.map(w => w.bbox.y));
     const maxX = Math.max(...group.map(w => w.bbox.x + w.bbox.w));
@@ -273,9 +292,9 @@ export async function scanStandardized(inputSource, targetWidth = 2000, options 
     const avgConf = group.reduce((acc, w) => acc + w.conf, 0) / group.length;
     const avgHeight = (maxY - minY);
 
-    let score = 20; // Lowered base score
+    let score = isHidden ? 20 : 0; // Base score higher for hidden text
     
-    // Length Penalty (Filter out tiny fragments like 'ing', 'NN')
+    // Length Penalty
     if (text.length < 5) score -= 30;
     else if (text.length > 10) score += 15;
 
@@ -284,31 +303,34 @@ export async function scanStandardized(inputSource, targetWidth = 2000, options 
     if (sources.includes('low_threshold')) score += 10;
     if (sources.length >= 2) score += 20;
 
-    // Location analysis (Is in margin?)
+    // Location analysis
     const isMargin = minX < 100 || maxX > (metadata.width - 100) || minY < 100 || maxY > (metadata.height - 100);
     if (isMargin) score += 15;
-    if (avgHeight < 25) score += 20; // Strong tiny text signal
+    if (avgHeight < 25) score += 20;
 
     // Confidence
     if (avgConf > 80) score += 10;
-    if (avgConf < 50) score -= 25; // Harsher penalty for low confidence
+    if (avgConf < 50) score -= 25;
 
     // Content analysis (The most important factor)
-    const containsUrl = /http|https|\.com|\.test|\.sh|curl|bash|admin|root|override|inject|exploit/i.test(text);
-    if (containsUrl) score += 40; // Increased bonus for clear attack patterns
+    const containsAttack = /http|https|\.com|\.test|\.sh|curl|bash|admin|root|override|inject|exploit|powershell|cmd|eval/i.test(text);
+    if (containsAttack) score += 70; // Massive bonus for attack content
+    
     if (/[A-Z]{3,}/.test(text)) score += 10;
     if (/=|:|\[|\]|\/|\.|\-/.test(text)) score += 10;
 
-    // Proximity Penalty: Check if it's too close to normal visible text
-    const isCloseToNormal = cleanNormal.some(norm => {
-      const dist = Math.sqrt(Math.pow(norm.bbox.x - minX, 2) + Math.pow(norm.bbox.y - minY, 2));
-      return dist < 50; // Within 50px of visible text is likely a halo/ghost
-    });
-    if (isCloseToNormal) score -= 30;
+    // Proximity Penalty (Only for hidden text)
+    if (isHidden) {
+      const isCloseToNormal = cleanNormal.some(norm => {
+        const dist = Math.sqrt(Math.pow(norm.bbox.x - minX, 2) + Math.pow(norm.bbox.y - minY, 2));
+        return dist < 50;
+      });
+      if (isCloseToNormal) score -= 30;
+    }
 
     return {
       x: minX, y: minY, w: maxX - minX, h: maxY - minY,
-      text, sources, score, avgConf
+      text, sources, score, avgConf, isHidden
     };
   });
 
@@ -378,13 +400,13 @@ if (process.argv[1].endsWith('ocr.js')) {
         const page = await pdf.getPage(1);
         const viewport = page.getViewport({ scale: 2.0 });
         
-        // We use canvas to render the PDF page to a buffer
         const canvas = createCanvas(viewport.width, viewport.height);
         const context = canvas.getContext('2d');
         
         await page.render({
           canvasContext: context,
-          viewport: viewport
+          viewport: viewport,
+          intent: 'print'
         }).promise;
         
         inputSource = canvas.toBuffer('image/png');
@@ -409,7 +431,7 @@ if (process.argv[1].endsWith('ocr.js')) {
         source: filePath,
         resolution: `${data.resolution.width}x${data.resolution.height}`,
         visualized_result: outputPath,
-        visible_text: data.normalWords.map(w => w.text).join(' '),
+        visible_text: data.visibleText,
         detected_attacks: data.hiddenAttacks.map(attack => ({
           type: attack.type,
           category: attack.category || 'hidden_text',

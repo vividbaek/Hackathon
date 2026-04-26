@@ -77,7 +77,41 @@ Individual words detected across all passes are deduplicated and then reconstruc
 
 ---
 
-## 5. Output & Visualization
+## 5. Risk Scoring Engine
+
+The system uses a weighted scoring model to distinguish between benign anomalies and actual attacks. A final score of **85 or higher** triggers an attack alert.
+
+### 5.1 OCR-based Hidden Text Scoring
+Hidden text is scored based on its physical properties and content.
+
+| Factor | Weight | Description |
+| :--- | :--- | :--- |
+| **Base Score** | +20 | Initial score for text found only in enhancement passes. |
+| **Tiny Text** | +20 | Awarded if the text height is < 25px (strong signal for hidden instructions). |
+| **Multiple Sources** | +20 | Awarded if the text is recovered by 2 or more different enhancement filters. |
+| **Attack Patterns** | **+40** | **Critical Bonus**: Detects keywords like `curl`, `bash`, `inject`, `exploit`, etc. |
+| **URL/Special Chars** | +10 | Bonus for URLs or high density of symbols (`=`, `:`, `[`, `]`). |
+| **Margin Location** | +15 | Text located in the extreme margins (top/bottom/sides) is more suspicious. |
+| **Confidence** | +10 / -25 | +10 for high OCR confidence (>80%), -25 for low confidence (<50%). |
+| **Proximity Penalty** | **-30** | **Critical Penalty**: If text is within 50px of normal visible text (prevents ghosting/halo false positives). |
+| **Length Penalty** | -30 | Applied to short fragments (< 5 chars) to filter out noise. |
+
+### 5.2 QR Code Payload Scoring
+QR codes are scored primarily on the risk of their decoded content.
+
+| Factor | Weight | Description |
+| :--- | :--- | :--- |
+| **Base Score** | +50 | All QR codes are treated as potentially suspicious "hidden intent" (base risk). |
+| **Command Injection** | **+45** | Decoded text contains shell commands or remote execution patterns. |
+| **Phishing/Suspicious URL**| +40 | Links to known shorteners (`bit.ly`) or deceptive domains. |
+| **Credential Exfiltration**| +45 | Patterns indicating secrets (e.g., `admin:password`, `API_KEY`). |
+| **Path Traversal** | +20 | Payload contains path sequences like `../etc/` or `C:\`. |
+| **Bypass Instructions** | +15 | Keywords like `override`, `bypass`, `ignore instructions`. |
+| **Payload Size** | +10 | Large payloads (>200 chars) in a small QR code increase risk score. |
+
+---
+
+## 6. Output & Visualization
 
 ### 📥 JSON Structure
 The output is designed for automation (`stdout`):
