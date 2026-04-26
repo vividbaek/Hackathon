@@ -6,6 +6,10 @@ import { writeFile, unlink, mkdir, readFile } from 'node:fs/promises';
 import path, { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { detectAndDecodeQR } from './utils/qr-processor.js';
+import { loadConfig } from './config.js';
+import { scanText } from './policy/engine.js';
+import { recordReport } from './guard.js';
+import { preprocessImage } from './image-preprocess.js';
 
 import pkgCanvas from 'canvas';
 const { createCanvas, DOMMatrix } = pkgCanvas;
@@ -313,9 +317,20 @@ export async function scanStandardized(inputSource, targetWidth = 2000, options 
     if (avgConf < 50) score -= 25;
 
     // Content analysis (The most important factor)
-    const containsAttack = /http|https|\.com|\.test|\.sh|curl|bash|admin|root|override|inject|exploit|powershell|cmd|eval/i.test(text);
-    if (containsAttack) score += 70; // Massive bonus for attack content
-    
+    const attackPatterns = [
+      /http|https|\.com|\.test|\.sh|curl|bash|powershell|cmd|eval/i,
+      /admin|root|override|inject|exploit|payload|bypass/i,
+      /transfer|funds|account|bank|credit|payment|invoice/i,
+      /token|password|secret|key|credential|login|auth/i,
+      /leak|exfil|upload|download|stolen|hacked/i,
+      /at[10]acker|p[4@][s5]{2}word|0verr[1i]de/i
+    ];
+    const containsAttack = attackPatterns.some(p => p.test(text));
+    const hasSensitiveData = /([a-z0-9_-]+[:=][a-z0-9_-]+)/i.test(text) || /[0-9]{10,}/.test(text);
+
+    if (containsAttack) score += isHidden ? 90 : 40;
+    if (hasSensitiveData) score += 20;
+
     if (/[A-Z]{3,}/.test(text)) score += 10;
     if (/=|:|\[|\]|\/|\.|\-/.test(text)) score += 10;
 
@@ -335,7 +350,7 @@ export async function scanStandardized(inputSource, targetWidth = 2000, options 
   });
 
   // Strict Threshold: Only high confidence attacks
-  const filteredAttacks = scoredLines.filter(line => line.score >= 85);
+  const filteredAttacks = scoredLines.filter(line => line.score >= 80);
 
   // --- 3. Merge QR Attacks ---
   const finalAttacks = [
@@ -378,7 +393,7 @@ async function runSelfTest() {
 }
 
 // CLI Execution
-if (process.argv[1].endsWith('ocr.js')) {
+if (process.argv[1]?.endsWith('ocr.js')) {
   const filePath = process.argv[2];
   if (!filePath) {
     console.error('Usage: node src/ocr.js <image_or_pdf_path>');
@@ -387,66 +402,115 @@ if (process.argv[1].endsWith('ocr.js')) {
 
   runSelfTest().then(async alive => {
     if (!alive) process.exit(1);
-    
-    let inputSource = filePath;
-    
-    // Handle PDF by converting first page to image
+
+    // Handle PDF by converting ALL pages to images
     if (filePath.toLowerCase().endsWith('.pdf')) {
-      console.error(`📄 PDF detected: ${filePath}. Extracting first page...`);
+      console.error(`PDF detected: ${filePath}. Processing all pages...`);
       try {
         const data = new Uint8Array(await readFile(filePath));
         const loadingTask = pdfjs.getDocument({ data, verbosity: 0 });
         const pdf = await loadingTask.promise;
-        const page = await pdf.getPage(1);
-        const viewport = page.getViewport({ scale: 2.0 });
-        
-        const canvas = createCanvas(viewport.width, viewport.height);
-        const context = canvas.getContext('2d');
-        
-        await page.render({
-          canvasContext: context,
-          viewport: viewport,
-          intent: 'print'
-        }).promise;
-        
-        inputSource = canvas.toBuffer('image/png');
+        const numPages = pdf.numPages;
+
+        for (let i = 1; i <= numPages; i++) {
+          console.error(`  -> Processing page ${i}/${numPages}...`);
+          const page = await pdf.getPage(i);
+          const viewport = page.getViewport({ scale: 2.0 });
+          const canvas = createCanvas(viewport.width, viewport.height);
+          const context = canvas.getContext('2d');
+
+          await page.render({
+            canvasContext: context,
+            viewport: viewport,
+            intent: 'print'
+          }).promise;
+
+          const pageBuffer = canvas.toBuffer('image/png');
+          await runPipelineForSource(pageBuffer, filePath, i);
+        }
       } catch (err) {
         console.error('Failed to process PDF:', err);
         process.exit(1);
       }
+    } else {
+      await runPipelineForSource(filePath, filePath, null);
     }
-
-    scanStandardized(inputSource).then(async data => {
-      // Visualization (Only for Scored Attacks)
-      const outputDir = 'examples/detected';
-      const fileName = path.basename(filePath, path.extname(filePath));
-      const outputPath = path.join(outputDir, `${fileName}_detected.png`);
-
-      await mkdir(outputDir, { recursive: true });
-      const vizBuffer = await processor.drawBoundingBoxes(inputSource, data.hiddenAttacks);
-      await writeFile(outputPath, vizBuffer);
-
-      // Construct JSON Output
-      const resultJson = {
-        source: filePath,
-        resolution: `${data.resolution.width}x${data.resolution.height}`,
-        visualized_result: outputPath,
-        visible_text: data.visibleText,
-        detected_attacks: data.hiddenAttacks.map(attack => ({
-          type: attack.type,
-          category: attack.category || 'hidden_text',
-          text: attack.text,
-          score: attack.score,
-          location: { x: attack.x, y: attack.y, w: attack.w, h: attack.h },
-          sources: attack.sources
-        }))
-      };
-
-      // Print only JSON to stdout
-      console.log(JSON.stringify(resultJson, null, 2));
-
-    }).catch(err => {
-      console.error(JSON.stringify({ error: 'Pipeline failed', details: err.message }, null, 2));
-    });
   });
+}
+
+/**
+ * Encapsulated Pipeline for a single image source
+ */
+async function runPipelineForSource(source, originalPath, pageNum) {
+  try {
+    const data = await scanStandardized(source);
+
+    // Visualization
+    const outputDir = 'examples/detected';
+    const fileName = path.basename(originalPath, path.extname(originalPath));
+    const suffix = pageNum ? `_p${pageNum}_detected.png` : '_detected.png';
+    const outputPath = path.join(outputDir, `${fileName}${suffix}`);
+
+    await mkdir(outputDir, { recursive: true });
+    const vizBuffer = await processor.drawBoundingBoxes(source, data.hiddenAttacks);
+    await writeFile(outputPath, vizBuffer);
+
+    // JSON Output
+    const resultJson = {
+      source: originalPath,
+      page: pageNum || 1,
+      resolution: `${data.resolution.width}x${data.resolution.height}`,
+      visualized_result: outputPath,
+      visible_text: data.visibleText,
+      detected_attacks: data.hiddenAttacks.map(attack => ({
+        type: attack.type,
+        category: attack.category || 'hidden_text',
+        text: attack.text,
+        score: attack.score,
+        location: { x: attack.x, y: attack.y, w: attack.w, h: attack.h },
+        sources: attack.sources
+      }))
+    };
+
+    console.log(JSON.stringify(resultJson, null, 2));
+
+    // Record to .404gent/ for dashboard integration
+    try {
+      const config = await loadConfig();
+      const preprocessResult = await preprocessImage(originalPath, config, { quiet: true });
+      const detections = preprocessResult.preprocessed?.detections ?? [];
+      const hiddenTexts = detections.filter(d => d.kind === 'hidden_text').map(d => d.text);
+      const allTexts = detections.map(d => d.text);
+      const scanInput = [...hiddenTexts, ...allTexts].filter(Boolean).join('\n');
+      const hiddenPrompts = data.hiddenAttacks.map(a => a.text);
+      const regions = data.hiddenAttacks.map(a => ({ x: a.x, y: a.y, w: a.w, h: a.h, text: a.text, score: a.score }));
+      const result = scanText({
+        surface: 'image',
+        text: scanInput || hiddenPrompts.join('\n'),
+        config,
+        evidence: {
+          imageId: preprocessResult.imageId,
+          imagePath: originalPath,
+          extractedText: data.visibleText || allTexts.join(' '),
+          hiddenPrompts: hiddenPrompts.length ? hiddenPrompts : [],
+          regions,
+          confidence: data.hiddenAttacks.length > 0 ? Math.max(...data.hiddenAttacks.map(a => (a.score ?? 0) / 100)) : null
+        }
+      });
+      const criticalHidden = detections.filter(d => d.kind === 'hidden_text' && d.severityHint === 'critical');
+      if (criticalHidden.length > 0 && result.decision === 'allow') {
+        result.decision = 'block';
+        if (!result.findings) result.findings = [];
+        for (const det of criticalHidden) {
+          result.findings.push({ id: 'image-hidden-attack', severity: 'critical', rationale: `Hidden ${det.meta?.type ?? 'text'} detected: ${(det.text ?? '').slice(0, 80)}`, category: det.meta?.category ?? 'visual_prompt_injection' });
+        }
+      }
+      await recordReport(result, config);
+      console.error(`Dashboard event recorded for ${originalPath}`);
+    } catch (e) {
+      console.error(`Warning: failed to record dashboard event: ${e.message}`);
+    }
+  } catch (err) {
+    console.error(JSON.stringify({ error: 'Pipeline failed', details: err.message }, null, 2));
+  }
 }

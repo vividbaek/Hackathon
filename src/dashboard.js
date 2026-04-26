@@ -741,7 +741,16 @@ export function createDashboardServer({ dataDir = '.404gent' } = {}) {
             const hiddenCount = hiddenTexts.length;
             const ocrCount = detections.filter(d => d.kind === 'ocr_text').length;
             const result = scanText({ surface: 'image', text: scanInput, config, evidence: { hiddenPrompts: hiddenTexts.length ? [hiddenTexts.join(' ')] : [] } });
-            scanResult = { decision: result.decision, findings: result.findings ?? [], hiddenCount, ocrCount };
+            const criticalHidden = detections.filter(d => d.kind === 'hidden_text' && d.severityHint === 'critical');
+            let decision = result.decision;
+            const findings = result.findings ?? [];
+            if (criticalHidden.length > 0 && decision === 'allow') {
+              decision = 'block';
+              for (const det of criticalHidden) {
+                findings.push({ id: 'image-hidden-attack', severity: 'critical', rationale: `Hidden ${det.meta?.type ?? 'text'} detected: ${(det.text ?? '').slice(0, 80)}`, category: det.meta?.category ?? 'visual_prompt_injection' });
+              }
+            }
+            scanResult = { decision, findings, hiddenCount, ocrCount };
           }
           return { imageId, rawPath, normalizedPath, preprocessed: !!preprocessed, scanResult };
         }));

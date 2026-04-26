@@ -46,14 +46,42 @@ function wordDetection(word, index, resolution, kind, severityHint) {
   };
 }
 
+function attackDetection(attack, index, resolution) {
+  const width = resolution.width || 1;
+  const height = resolution.height || 1;
+  return {
+    id: `hidden_text-attack-${index + 1}`,
+    kind: 'hidden_text',
+    severityHint: 'critical',
+    text: attack.text,
+    extractedValue: attack.text,
+    bbox: {
+      x: Number(((attack.x ?? 0) / width).toFixed(6)),
+      y: Number(((attack.y ?? 0) / height).toFixed(6)),
+      width: Number(((attack.w ?? 0) / width).toFixed(6)),
+      height: Number(((attack.h ?? 0) / height).toFixed(6))
+    },
+    confidence: Number(((attack.score ?? 0) / 100).toFixed(4)),
+    meta: {
+      engine: 'attack-detection',
+      type: attack.type,
+      category: attack.category,
+      sources: attack.sources
+    }
+  };
+}
+
 function detectionsFromScan(scan) {
   const hidden = (scan.hiddenWords ?? []).map((word, index) =>
     wordDetection(word, index, scan.resolution, 'hidden_text', 'critical')
   );
+  const attacks = (scan.hiddenAttacks ?? []).map((attack, index) =>
+    attackDetection(attack, index, scan.resolution)
+  );
   const visible = (scan.normalWords ?? [])
     .filter((word) => Number(word.conf ?? 0) >= 60)
     .map((word, index) => wordDetection(word, index, scan.resolution, 'ocr_text', 'low'));
-  return [...hidden, ...visible];
+  return [...hidden, ...attacks, ...visible];
 }
 
 export function createPreprocessedImageDocument({
