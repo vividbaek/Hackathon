@@ -1,0 +1,10 @@
+[
+  {
+    "id": "hackathon-no-env",
+    "surface": "*",
+    "severity": "high",
+    "action": "block",
+    "pattern": "\\.env",
+    "message": "Do not expose environment files."
+  }
+]
