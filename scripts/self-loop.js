@@ -1,0 +1,102 @@
+import { readFile, mkdir, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+
+const dataDir = process.env.FOUR04GENT_DATA_DIR ?? '.404gent';
+const windowMinutes = Number(process.env.FOUR04GENT_SELF_LOOP_MINUTES ?? 30);
+const eventsPath = join(dataDir, 'events.jsonl');
+const candidatesPath = join(dataDir, 'rule-candidates.json');
+
+function parseJsonLines(raw) {
+  return raw
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function candidateId(event, finding) {
+  return `candidate-${event.event?.type ?? event.surface}-${finding.category}-${finding.id}`;
+}
+
+function toCandidate(group) {
+  const strongest = group.events[0];
+  const finding = strongest.finding;
+  const match = finding.match && finding.match.length <= 120 ? finding.match : finding.id;
+
+  return {
+    id: candidateId(strongest.event, finding),
+    status: 'candidate',
+    reason: `Observed ${group.events.length} matching event(s) in the last ${windowMinutes} minutes.`,
+    rule: {
+      id: `${finding.id}-self-loop-candidate`,
+      appliesTo: [strongest.event.event?.type ?? strongest.event.surface],
+      severity: finding.severity,
+      category: finding.category,
+      pattern: escapeRegex(match),
+      rationale: finding.rationale,
+      remediation: finding.remediation
+    },
+    evidence: group.events.slice(0, 5).map(({ event, finding: eventFinding }) => ({
+      eventId: event.id,
+      timestamp: event.timestamp ?? event.recordedAt,
+      decision: event.decision,
+      match: eventFinding.match,
+      companyId: event.event?.companyId,
+      agentId: event.event?.agentId
+    }))
+  };
+}
+
+async function main() {
+  let raw;
+  try {
+    raw = await readFile(eventsPath, 'utf8');
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      console.log(JSON.stringify({ ok: true, candidates: 0, message: 'No events found.' }, null, 2));
+      return;
+    }
+    throw error;
+  }
+
+  const cutoff = Date.now() - windowMinutes * 60 * 1000;
+  const events = parseJsonLines(raw).filter((event) => {
+    const timestamp = Date.parse(event.timestamp ?? event.recordedAt ?? 0);
+    return Number.isFinite(timestamp) && timestamp >= cutoff;
+  });
+
+  const groups = new Map();
+  for (const event of events) {
+    for (const finding of event.findings ?? []) {
+      if (!['block', 'warn'].includes(event.decision)) {
+        continue;
+      }
+      const key = `${event.event?.type ?? event.surface}:${finding.category}:${finding.id}:${finding.match ?? ''}`;
+      const group = groups.get(key) ?? { events: [] };
+      group.events.push({ event, finding });
+      groups.set(key, group);
+    }
+  }
+
+  const candidates = [...groups.values()]
+    .filter((group) => group.events.length >= 1)
+    .sort((a, b) => b.events.length - a.events.length)
+    .map(toCandidate);
+
+  const output = {
+    generatedAt: new Date().toISOString(),
+    windowMinutes,
+    source: eventsPath,
+    candidates
+  };
+
+  await mkdir(dirname(candidatesPath), { recursive: true });
+  await writeFile(candidatesPath, `${JSON.stringify(output, null, 2)}\n`);
+  console.log(JSON.stringify({ ok: true, candidates: candidates.length, path: candidatesPath }, null, 2));
+}
+
+await main();

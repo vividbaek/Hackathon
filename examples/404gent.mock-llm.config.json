@@ -1,0 +1,6 @@
+{
+  "dataDir": ".404gent",
+  "llm": {
+    "provider": "mock"
+  }
+}

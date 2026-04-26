@@ -1,0 +1,6 @@
+{
+  "dataDir": ".404gent",
+  "integrations": {
+    "cmuxNative": true
+  }
+}
