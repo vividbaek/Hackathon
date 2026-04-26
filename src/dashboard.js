@@ -2,6 +2,7 @@
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { extname, join, resolve, sep } from 'node:path';
+import { approveRule, rejectRule, testRule } from './learn/index.js';
 
 const DEFAULT_PORT = 4040;
 const MAX_PORT = 4050;
@@ -304,14 +305,68 @@ function collectTimeline(events, candidates) {
 
 function guardLayerLabel(surface) {
   return {
-    image: 'Vision Guard',
-    vision_observation: 'Vision Guard',
+    image: 'Screen Watch',
+    vision_observation: 'Screen Watch',
     prompt: 'Prompt Guard',
-    llm: 'LLM Guard',
-    command: 'Command Guard',
+    llm: 'LLM Review',
+    command: 'Shell Guard',
     output: 'Output Guard',
-    os: 'OS Guard'
+    os: 'ES Guard'
   }[surface] ?? `${surface} Guard`;
+}
+
+const layerDefinitions = [
+  { id: 'prompt', label: 'Prompt Guard', surfaces: ['prompt'] },
+  { id: 'shell', label: 'Shell Guard', surfaces: ['command'] },
+  { id: 'es', label: 'ES Guard', surfaces: ['os'] },
+  { id: 'output', label: 'Output Guard', surfaces: ['output'] },
+  { id: 'screen', label: 'Screen Watch', surfaces: ['image', 'vision_observation'] }
+];
+
+function layerForSurface(surface) {
+  return layerDefinitions.find(layer => layer.surfaces.includes(surface)) ?? null;
+}
+
+function buildLayerOverview(events) {
+  const overview = layerDefinitions.map(layer => ({
+    id: layer.id,
+    label: layer.label,
+    surfaces: layer.surfaces,
+    total: 0,
+    block: 0,
+    warn: 0,
+    allow: 0,
+    topRule: null,
+    latest: null,
+    status: 'idle'
+  }));
+  const byId = Object.fromEntries(overview.map(layer => [layer.id, layer]));
+  const ruleCounts = Object.fromEntries(overview.map(layer => [layer.id, {}]));
+
+  for (const ev of events) {
+    const surface = ev.surface ?? ev.event?.type ?? 'unknown';
+    const layer = layerForSurface(surface);
+    if (!layer) continue;
+    const item = byId[layer.id];
+    const decision = ev.decision ?? 'allow';
+    item.total += 1;
+    if (decision === 'block') item.block += 1;
+    else if (decision === 'warn') item.warn += 1;
+    else if (decision === 'allow') item.allow += 1;
+
+    const ts = eventTime(ev);
+    if (ts && (!item.latest || Date.parse(ts) > Date.parse(item.latest))) item.latest = ts;
+    for (const finding of ev.findings ?? []) {
+      if (!finding.id) continue;
+      ruleCounts[layer.id][finding.id] = (ruleCounts[layer.id][finding.id] ?? 0) + 1;
+    }
+  }
+
+  for (const item of overview) {
+    item.status = item.block > 0 ? 'block' : item.warn > 0 ? 'warn' : item.total > 0 ? 'allow' : 'idle';
+    item.topRule = Object.entries(ruleCounts[item.id]).sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
+  }
+  return overview;
 }
 
 function taskOperation(ev) {
@@ -398,7 +453,84 @@ function buildVisionFlow(events) {
   };
 }
 
-export function buildDashboardModel({ events = [], candidates = [], state = {} } = {}) {
+function candidateId(entry = {}) {
+  return entry.id ?? entry.rule?.id ?? '';
+}
+
+function candidateRule(entry = {}) {
+  return entry.rule ?? entry;
+}
+
+function candidateLayer(entry = {}) {
+  const rule = candidateRule(entry);
+  return entry.layer ?? guardLayerLabel(rule.appliesTo?.[0] ?? rule.appliesTo ?? 'policy');
+}
+
+function candidateScore(entry = {}) {
+  const score = entry.metrics?.score;
+  return typeof score === 'number' ? Math.round(score * 100) : null;
+}
+
+function buildSelfHealingModel({ events = [], candidates = [], pending = {}, shadow = {}, shadowEvents = [], approved = {} } = {}) {
+  const candidateList = Array.isArray(candidates) ? candidates : candidates.candidates ?? [];
+  const pendingRules = pending.rules ?? candidateList;
+  const shadowRules = shadow.rules ?? [];
+  const approvedRules = approved.rules ?? [];
+  const riskyEvents = events.filter((event) => ['block', 'warn'].includes(event.decision));
+  const shadowByRule = shadowEvents.reduce((acc, event) => {
+    const id = event.ruleId;
+    if (!id) return acc;
+    if (!acc[id]) acc[id] = { events: 0, wouldBlock: 0, falsePositive: 0, recent: null };
+    acc[id].events += 1;
+    if (event.wouldDecision === 'block') acc[id].wouldBlock += 1;
+    if (event.actualDecision === 'allow' && event.wouldDecision === 'block') acc[id].falsePositive += 1;
+    acc[id].recent = acc[id].recent && Date.parse(acc[id].recent) > Date.parse(event.timestamp ?? '')
+      ? acc[id].recent
+      : event.timestamp;
+    return acc;
+  }, {});
+
+  return {
+    headline: 'Guardrails get stronger over time.',
+    note: 'Rules stay in shadow mode until a human approves them.',
+    loop: [
+      { id: 'collect', label: 'Collect', value: riskyEvents.length, detail: 'risky events' },
+      { id: 'analyze', label: 'Analyze', value: candidateList.length, detail: 'candidates' },
+      { id: 'shadow', label: 'Shadow', value: shadowRules.length, detail: 'would-block tests' },
+      { id: 'pending', label: 'Pending', value: pendingRules.length, detail: 'awaiting approval' },
+      { id: 'applied', label: 'Applied', value: approvedRules.length, detail: 'active rules' }
+    ],
+    pending: pendingRules.map((entry) => ({
+      id: candidateId(entry),
+      status: entry.status ?? 'pending',
+      layer: candidateLayer(entry),
+      score: candidateScore(entry),
+      falsePositive: entry.metrics?.false_positive,
+      blockRate: entry.metrics?.block_rate,
+      evidenceCount: entry.evidence?.length ?? entry.evidenceCount ?? 0,
+      source: entry.reason ?? `Learned from ${entry.evidence?.length ?? entry.evidenceCount ?? 0} event(s).`,
+      rule: candidateRule(entry),
+      shadow: shadowByRule[candidateId(entry)] ?? { events: 0, wouldBlock: 0, falsePositive: 0, recent: null }
+    })).slice(0, 12),
+    shadow: shadowRules.map((entry) => ({
+      id: candidateId(entry),
+      layer: candidateLayer(entry),
+      score: candidateScore(entry),
+      status: entry.status ?? 'shadow',
+      rule: candidateRule(entry),
+      stats: shadowByRule[candidateId(entry)] ?? { events: 0, wouldBlock: 0, falsePositive: 0, recent: null }
+    })).slice(0, 12),
+    applied: approvedRules.map((rule) => ({
+      id: rule.id,
+      layer: guardLayerLabel(rule.appliesTo?.[0] ?? rule.appliesTo ?? 'policy'),
+      severity: rule.severity,
+      category: rule.category,
+      pattern: rule.pattern
+    })).slice(0, 12)
+  };
+}
+
+export function buildDashboardModel({ events = [], candidates = [], state = {}, pending = {}, shadow = {}, shadowEvents = [], approved = {} } = {}) {
   const recentEvents = events.slice(-100);
   const candidateList = Array.isArray(candidates) ? candidates : candidates.candidates ?? [];
   const agents = agentDefinitions.map(def => summarizeAgent(def, recentEvents, candidateList));
@@ -407,6 +539,7 @@ export function buildDashboardModel({ events = [], candidates = [], state = {} }
     state,
     counts: summarizeCounts(recentEvents, candidateList),
     safetyScore: computeSafetyScore(recentEvents, candidateList),
+    layerOverview: buildLayerOverview(recentEvents),
     agentStats: computeAgentStats(recentEvents),
     agents,
     edges: graphEdges.map(([from, to]) => ({ from, to })),
@@ -417,6 +550,7 @@ export function buildDashboardModel({ events = [], candidates = [], state = {} }
     imageFindings: collectImageFindings(recentEvents),
     hiddenPromptDiscoveries: collectHiddenPromptDiscoveries(recentEvents),
     candidates: candidateList.slice(0, 8),
+    selfHealing: buildSelfHealingModel({ events: recentEvents, candidates, pending, shadow, shadowEvents, approved }),
     timeline: collectTimeline(recentEvents, candidateList),
     events: recentEvents.slice(-100).reverse(),
     surfaceCounts: summarizeSurfaces(recentEvents)
@@ -424,12 +558,16 @@ export function buildDashboardModel({ events = [], candidates = [], state = {} }
 }
 
 export async function readDashboardModel({ dataDir = '.404gent' } = {}) {
-  const [events, candidates, state] = await Promise.all([
+  const [events, candidates, state, pending, shadow, shadowEvents, approved] = await Promise.all([
     readJsonLines(join(dataDir, 'events.jsonl')),
     readJson(join(dataDir, 'rule-candidates.json'), { candidates: [] }),
-    readJson(join(dataDir, 'state.json'), {})
+    readJson(join(dataDir, 'state.json'), {}),
+    readJson(join(dataDir, 'pending-rules.json'), { rules: [] }),
+    readJson(join(dataDir, 'shadow-rules.json'), { rules: [] }),
+    readJsonLines(join(dataDir, 'shadow-events.jsonl')),
+    readJson(join(dataDir, 'approved-rules.json'), { rules: [] })
   ]);
-  return buildDashboardModel({ events, candidates, state });
+  return buildDashboardModel({ events, candidates, state, pending, shadow, shadowEvents, approved });
 }
 
 function sendJson(res, body) {
@@ -474,6 +612,16 @@ export function createDashboardServer({ dataDir = '.404gent' } = {}) {
       }
       if (url.pathname === '/api/status') { sendJson(res, await readDashboardModel({ dataDir })); return; }
       if (url.pathname === '/api/image') { await sendEvidenceImage(res, url.searchParams.get('path')); return; }
+      if (url.pathname.startsWith('/api/learn/')) {
+        if (req.method !== 'POST') { res.writeHead(405); res.end('Method not allowed'); return; }
+        const id = url.searchParams.get('rule');
+        const action = url.pathname.split('/').at(-1);
+        if (!id) { res.writeHead(400); res.end(JSON.stringify({ error: 'Missing rule id.' })); return; }
+        if (action === 'approve') { sendJson(res, await approveRule(id, { dataDir })); return; }
+        if (action === 'reject') { sendJson(res, await rejectRule(id, { dataDir })); return; }
+        if (action === 'test') { sendJson(res, await testRule(id, { dataDir })); return; }
+        res.writeHead(404); res.end(JSON.stringify({ error: 'Unknown learn action.' })); return;
+      }
       if (url.pathname === '/' || url.pathname === '/dashboard') { sendHtml(res); return; }
       res.writeHead(404); res.end('Not found');
     } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: e.message })); }
@@ -605,6 +753,7 @@ svg.graph{display:block;width:100%;min-width:960px;height:310px;}
 .badge-image,.badge-vision_observation{background:#ede9fe;color:#6d28d9;}
 .badge-prompt{background:#dbeafe;color:#1d4ed8;}
 .badge-command{background:#fef3c7;color:#92400e;}
+.badge-os{background:#fee2e2;color:#991b1b;}
 .badge-output{background:#d1fae5;color:#065f46;}
 .badge-llm{background:#cffafe;color:#0e7490;}
 .badge-unknown{background:#f3f4f6;color:#6b7280;}
@@ -712,6 +861,43 @@ select{border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-si
 .surf-card strong{display:block;font-size:22px;font-weight:800;margin-top:6px;}
 .surf-card span{font-size:11px;color:var(--muted);}
 
+/* Self-healing tab */
+.self-wrap{padding:16px;max-width:1400px;margin:0 auto;display:flex;flex-direction:column;gap:16px;}
+.self-hero{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 20px;background:linear-gradient(90deg,#f8fafc,#fff);border:1px solid var(--border);border-radius:var(--r);}
+.self-hero h2{font-size:18px;font-weight:900;margin-bottom:4px;}
+.self-hero p{font-size:12px;color:var(--muted);}
+.self-badge{font-size:11px;font-weight:800;color:#065f46;background:#d1fae5;border:1px solid #6ee7b7;border-radius:999px;padding:6px 10px;white-space:nowrap;}
+.self-loop{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;padding:16px;}
+.self-step{position:relative;border:1px solid var(--border);border-radius:8px;background:#fff;padding:14px;min-height:92px;}
+.self-step:not(:last-child)::after{content:'→';position:absolute;right:-14px;top:34px;color:#94a3b8;font-weight:900;z-index:2;}
+.self-step.active{border-color:#6ee7b7;background:#f0fdf4;}
+.self-step-label{font-size:11px;text-transform:uppercase;letter-spacing:.06em;font-weight:800;color:var(--muted);}
+.self-step-value{font-size:30px;font-weight:900;line-height:1.1;margin-top:6px;color:var(--ink);}
+.self-step-detail{font-size:11px;color:var(--muted);margin-top:2px;}
+.self-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;}
+.self-card{border:1px solid var(--border);border-radius:var(--r);background:#fff;padding:14px;display:flex;flex-direction:column;gap:12px;}
+.self-card-top{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;}
+.self-rule-id{font-size:13px;font-weight:900;word-break:break-all;}
+.self-layer{font-size:10px;font-weight:800;text-transform:uppercase;color:#4338ca;background:#e0e7ff;border-radius:999px;padding:3px 7px;white-space:nowrap;}
+.self-score{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;}
+.self-score-box{border:1px solid var(--border);border-radius:7px;padding:8px;background:#f8fafc;}
+.self-score-box strong{display:block;font-size:18px;line-height:1;color:var(--ink);}
+.self-score-box span{display:block;font-size:10px;color:var(--muted);text-transform:uppercase;margin-top:4px;}
+.self-pattern{border:1px solid var(--border);border-radius:7px;background:#f8fafc;padding:8px;}
+.self-pattern code{font-size:11px;word-break:break-all;color:var(--ink);}
+.self-source{font-size:11px;color:var(--muted);line-height:1.45;}
+.self-actions{display:flex;gap:8px;margin-top:auto;}
+.self-btn{border:1px solid var(--border);background:#fff;border-radius:6px;padding:7px 10px;font-size:11px;font-weight:800;cursor:pointer;font-family:inherit;}
+.self-btn:hover{background:#f8fafc;}
+.self-btn.approve{background:#dcfce7;border-color:#86efac;color:#166534;}
+.self-btn.reject{background:#fee2e2;border-color:#fca5a5;color:#991b1b;}
+.self-btn.test{background:#eef2ff;border-color:#c7d2fe;color:#4338ca;}
+.self-table{width:100%;border-collapse:collapse;font-size:12px;}
+.self-table th,.self-table td{padding:9px 10px;border-bottom:1px solid var(--border);text-align:left;vertical-align:top;}
+.self-table th{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:800;background:#f8fafc;}
+.self-result{font-size:12px;color:var(--muted);padding:0 16px 16px;}
+@media(max-width:900px){.self-loop{grid-template-columns:1fr;}.self-step:not(:last-child)::after{display:none;}.self-hero{align-items:flex-start;flex-direction:column;}}
+
 /* Shared */
 .empty{font-size:12px;color:var(--muted);padding:12px 0;}
 code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;}
@@ -735,6 +921,24 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
 /* 3-agent parallel grid */
 .agent-flows-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;padding:16px;}
 @media(max-width:900px){.agent-flows-grid{grid-template-columns:1fr;}}
+
+/* Layer overview */
+.layer-overview-grid{display:grid;grid-template-columns:repeat(5,minmax(150px,1fr));gap:12px;padding:0 16px 16px;}
+.layer-card{border:1.5px solid var(--border);border-radius:8px;background:#fff;padding:12px;display:flex;flex-direction:column;gap:10px;min-width:0;}
+.layer-card.block{border-color:#fca5a5;background:#fff1f2;}
+.layer-card.warn{border-color:#fcd34d;background:#fffbeb;}
+.layer-card.allow{border-color:#6ee7b7;background:#f0fdf4;}
+.layer-card.idle{background:#f8fafc;color:var(--muted);}
+.layer-card-top{display:flex;align-items:center;justify-content:space-between;gap:8px;}
+.layer-name{font-size:13px;font-weight:800;color:var(--ink);}
+.layer-card.idle .layer-name{color:var(--muted);}
+.layer-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;}
+.layer-stat{border:1px solid var(--border);border-radius:6px;background:rgba(255,255,255,.75);padding:6px;text-align:center;}
+.layer-stat strong{display:block;font-size:18px;line-height:1.1;}
+.layer-stat span{display:block;font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin-top:2px;}
+.layer-meta{display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted);min-width:0;}
+.layer-meta code{font-size:10px;background:transparent;color:inherit;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block;}
+@media(max-width:1200px){.layer-overview-grid{grid-template-columns:repeat(auto-fit,minmax(180px,1fr));}}
 
 /* Agent columns */
 .afc-col{border:2px solid var(--border);border-radius:var(--r);overflow:hidden;background:#fff;}
@@ -930,6 +1134,7 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
     <button class="tab-btn active" data-tab="overview">Overview</button>
     <button class="tab-btn" data-tab="history">History</button>
     <button class="tab-btn" data-tab="forensics">Image Forensics</button>
+    <button class="tab-btn" data-tab="self-healing">Self-Healing</button>
     <button class="tab-btn" data-tab="rules">Rule Engine</button>
   </nav>
   <div class="live-badge">
@@ -946,6 +1151,14 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
   <div class="ov-new-wrap">
 
     <div id="action-banner" style="display:none;"></div>
+
+    <!-- Layer overview -->
+    <div class="panel ov-section">
+      <div class="panel-hd">
+        <h2>5-Layer Defense Overview</h2>
+      </div>
+      <div id="layer-overview" class="layer-overview-grid"></div>
+    </div>
 
     <!-- LLM agent pipeline -->
     <div class="panel ov-section">
@@ -1039,6 +1252,11 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
   <div class="foren-wrap" id="foren-content"></div>
 </div>
 
+<!-- Self-Healing -->
+<div class="tab-panel" id="panel-self-healing">
+  <div class="self-wrap" id="self-content"></div>
+</div>
+
 <!-- Rule Engine -->
 <div class="tab-panel" id="panel-rules">
   <div class="rule-wrap" id="rule-content"></div>
@@ -1098,6 +1316,8 @@ document.getElementById('hist-agent-tabs').addEventListener('click',e=>{
 
 // ── Agent detail click handling ──────────────────────────────────────────────
 document.addEventListener('click',e=>{
+  const selfBtn=e.target.closest('.self-btn[data-action][data-rule]');
+  if(selfBtn){handleSelfHealingAction(selfBtn);return;}
   const col=e.target.closest('.afc-col[data-agent-id]');
   if(col){toggleAgentDetail(col.dataset.agentId);return;}
   const closeBtn=e.target.closest('.adp-close');
@@ -1118,6 +1338,26 @@ function renderMetrics(c, ss){
   '</div>';
   const items=[['All',c.total,''],['Blocked',c.block,'m-block'],['Warning',c.warn,'m-warn'],['Allowed',c.allow,'m-allow'],['Rule Candidates',c.candidates,''],['Hidden Prompts',c.hiddenPrompts,'m-inject']];
   document.getElementById('metrics-bar').innerHTML=gaugeHtml+items.map(([l,v,cl])=>'<div class="metric '+cl+'"><strong>'+v+'</strong><span>'+l+'</span></div>').join('');
+}
+
+// ── 5-layer defense overview ────────────────────────────────────────────────
+function renderLayerOverview(model){
+  const layers=model.layerOverview||[];
+  const el=document.getElementById('layer-overview');
+  if(!el)return;
+  el.innerHTML=layers.map(layer=>{
+    const st=layer.status||'idle';
+    const topRule=layer.topRule?'<code title="'+h(layer.topRule)+'">'+h(layer.topRule)+'</code>':'<span>None</span>';
+    return '<div class="layer-card '+h(st)+'">'+
+      '<div class="layer-card-top"><div class="layer-name">'+h(layer.label)+'</div><span class="pill sm '+h(st)+'">'+h(ST_EN[st]||st)+'</span></div>'+
+      '<div class="layer-stats">'+
+        '<div class="layer-stat"><strong>'+h(layer.total||0)+'</strong><span>Total</span></div>'+
+        '<div class="layer-stat"><strong>'+h(layer.block||0)+'</strong><span>Block</span></div>'+
+        '<div class="layer-stat"><strong>'+h(layer.warn||0)+'</strong><span>Warn</span></div>'+
+      '</div>'+
+      '<div class="layer-meta"><div>Top rule '+topRule+'</div><div>Latest '+h(fmt(layer.latest))+'</div></div>'+
+    '</div>';
+  }).join('')||'<div class="empty">No layer data.</div>';
 }
 
 // ── Parallel LLM agent task logs ─────────────────────────────────────────────
@@ -1408,6 +1648,89 @@ function renderForensics(model){
   document.getElementById('foren-content').innerHTML=html;
 }
 
+// ── Self-healing tab ─────────────────────────────────────────────────────────
+function pct(v){
+  return typeof v==='number' ? Math.round(v*100)+'%' : 'n/a';
+}
+
+function renderSelfHealing(model){
+  const sh=model.selfHealing||{loop:[],pending:[],shadow:[],applied:[]};
+  let html='';
+  html+='<div class="self-hero"><div><h2>'+h(sh.headline||'Guardrails get stronger over time.')+'</h2><p>'+h(sh.note||'Rules stay in shadow mode until a human approves them.')+'</p></div><span class="self-badge">Human approval required</span></div>';
+  html+='<div class="panel"><div class="panel-hd"><h2>Self-Healing Loop</h2><span style="font-size:12px;color:var(--muted);">Collect → Analyze → Shadow → Pending → Applied</span></div><div class="self-loop">'+
+    (sh.loop||[]).map(step=>'<div class="self-step '+(step.value>0?'active':'')+'"><div class="self-step-label">'+h(step.label)+'</div><div class="self-step-value">'+h(step.value)+'</div><div class="self-step-detail">'+h(step.detail)+'</div></div>').join('')+
+  '</div></div>';
+
+  html+='<div class="panel"><div class="panel-hd"><h2>Pending Rules</h2><span style="font-size:12px;color:var(--muted);">'+(sh.pending||[]).length+' awaiting approval</span></div><div class="panel-bd">';
+  if((sh.pending||[]).length){
+    html+='<div class="self-grid">'+sh.pending.map(c=>{
+      const rule=c.rule||{};
+      return '<div class="self-card">'+
+        '<div class="self-card-top"><div class="self-rule-id">'+h(c.id||rule.id||'candidate')+'</div><span class="self-layer">'+h(c.layer)+'</span></div>'+
+        '<div class="self-score">'+
+          '<div class="self-score-box"><strong>'+(c.score==null?'n/a':h(c.score)+'%')+'</strong><span>Score</span></div>'+
+          '<div class="self-score-box"><strong>'+pct(c.blockRate)+'</strong><span>Block</span></div>'+
+          '<div class="self-score-box"><strong>'+pct(c.falsePositive)+'</strong><span>FP</span></div>'+
+        '</div>'+
+        '<div class="self-pattern"><span class="lbl-sm">Pattern</span><code>'+h(rule.pattern||'')+'</code></div>'+
+        '<div class="self-source">Source: '+h(c.source||'Self-healing analysis')+'<br>Shadow: '+h(c.shadow?.wouldBlock??0)+' would-block · '+h(c.shadow?.falsePositive??0)+' false positive</div>'+
+        '<div class="self-actions">'+
+          '<button class="self-btn approve" data-action="approve" data-rule="'+h(c.id)+'">Approve</button>'+
+          '<button class="self-btn reject" data-action="reject" data-rule="'+h(c.id)+'">Reject</button>'+
+          '<button class="self-btn test" data-action="test" data-rule="'+h(c.id)+'">Test More</button>'+
+        '</div>'+
+      '</div>';
+    }).join('')+'</div>';
+  } else {
+    html+='<div class="empty">No pending rules. Run <code>npm run self-loop</code> or <code>node src/cli.js learn analyze</code> after risky events are collected.</div>';
+  }
+  html+='</div><div class="self-result" id="self-action-result"></div></div>';
+
+  html+='<div class="panel"><div class="panel-hd"><h2>Shadow Tests</h2><span style="font-size:12px;color:var(--muted);">'+(sh.shadow||[]).length+' rules running safely</span></div><div class="panel-bd">';
+  if((sh.shadow||[]).length){
+    html+='<table class="self-table"><thead><tr><th>Rule</th><th>Layer</th><th>Score</th><th>Would Block</th><th>False Positive</th><th>Recent</th></tr></thead><tbody>'+
+      sh.shadow.map(s=>'<tr><td><code>'+h(s.id)+'</code></td><td>'+h(s.layer)+'</td><td>'+(s.score==null?'n/a':h(s.score)+'%')+'</td><td>'+h(s.stats?.wouldBlock??0)+'</td><td>'+h(s.stats?.falsePositive??0)+'</td><td>'+(s.stats?.recent?fmtFull(s.stats.recent):'—')+'</td></tr>').join('')+
+    '</tbody></table>';
+  } else {
+    html+='<div class="empty">No shadow rules are running.</div>';
+  }
+  html+='</div></div>';
+
+  html+='<div class="panel"><div class="panel-hd"><h2>Applied Rules</h2><span style="font-size:12px;color:var(--muted);">'+(sh.applied||[]).length+' active learned rules</span></div><div class="panel-bd">';
+  if((sh.applied||[]).length){
+    html+='<table class="self-table"><thead><tr><th>Rule</th><th>Layer</th><th>Severity</th><th>Category</th><th>Pattern</th></tr></thead><tbody>'+
+      sh.applied.map(r=>'<tr><td><code>'+h(r.id)+'</code></td><td>'+h(r.layer)+'</td><td>'+h(r.severity||'')+'</td><td>'+h(r.category||'')+'</td><td><code>'+h(r.pattern||'')+'</code></td></tr>').join('')+
+    '</tbody></table>';
+  } else {
+    html+='<div class="empty">No learned rules have been approved yet.</div>';
+  }
+  html+='</div></div>';
+
+  document.getElementById('self-content').innerHTML=html;
+}
+
+async function handleSelfHealingAction(btn){
+  const action=btn.dataset.action;
+  const rule=btn.dataset.rule;
+  const result=document.getElementById('self-action-result');
+  btn.disabled=true;
+  if(result)result.textContent='Running '+action+' for '+rule+'...';
+  try{
+    const res=await fetch('/api/learn/'+action+'?rule='+encodeURIComponent(rule),{method:'POST'});
+    const body=await res.json();
+    if(!res.ok)throw new Error(body.error||'Request failed');
+    if(result)result.textContent=action==='test'
+      ?'Test complete: '+JSON.stringify(body.metrics||body)
+      :'Rule '+rule+' '+(action==='approve'?'approved.':'rejected.');
+    const model=await (await fetch('/api/status')).json();
+    renderAll(model);
+  }catch(error){
+    if(result)result.textContent='Action failed: '+error.message;
+  }finally{
+    btn.disabled=false;
+  }
+}
+
 // ── Rule engine tab ──────────────────────────────────────────────────────────
 function renderRules(model){
   const rb=model.runbook||[];
@@ -1550,6 +1873,7 @@ function renderAll(model){
   renderMetrics(model.counts,model.safetyScore);
   if(activeTab==='overview'){
     renderActionBanner(model);
+    renderLayerOverview(model);
     renderAgentFlows(model);
     renderVisionFlow(model);
     renderDiscoveries(model.hiddenPromptDiscoveries||[]);
@@ -1559,6 +1883,8 @@ function renderAll(model){
     renderHistory(model);
   } else if(activeTab==='forensics'){
     renderForensics(model);
+  } else if(activeTab==='self-healing'){
+    renderSelfHealing(model);
   } else if(activeTab==='rules'){
     renderRules(model);
   }
