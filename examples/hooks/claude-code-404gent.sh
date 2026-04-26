@@ -1,3 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
-node src/cli.js scan-prompt "$*"
+
+if [ "${1:-}" = "run" ]; then
+  shift
+  node src/cli.js run -- "$@"
+else
+  node src/cli.js scan-prompt "$*"
+fi

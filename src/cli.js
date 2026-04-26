@@ -7,6 +7,7 @@ import { appendVectorDocument } from './vector-store.js';
 import { createLlmProvider, shouldReviewWithLlm } from './providers/llm.js';
 import { encodeImageFile, createVisionProviderFromConfig } from './providers/vision-llm.js';
 import { highestSeverity } from './policy/severity.js';
+import { runGuardedCommand } from './runner.js';
 
 const HELP = `404gent - Terminal-first guardrails for AI coding agents in cmux.
 
@@ -18,6 +19,7 @@ Usage:
   404gent scan-image <vlm-or-ocr-text>
   404gent scan-image --file <image-path>
   404gent scan-llm <text>
+  404gent run -- <command> [args...]
   404gent doctor
   404gent tower
 
@@ -31,6 +33,13 @@ function parseArgs(argv) {
   const args = [...argv];
   const options = { json: false, configPath: undefined, filePath: undefined };
   const positionals = [];
+  const separatorIndex = args.indexOf('--');
+  let passthrough = [];
+
+  if (separatorIndex >= 0) {
+    passthrough = args.splice(separatorIndex + 1);
+    args.splice(separatorIndex, 1);
+  }
 
   while (args.length > 0) {
     const arg = args.shift();
@@ -45,7 +54,7 @@ function parseArgs(argv) {
     }
   }
 
-  return { command: positionals[0] ?? 'help', text: positionals.slice(1).join(' '), options };
+  return { command: positionals[0] ?? 'help', text: positionals.slice(1).join(' '), options, passthrough };
 }
 
 function printResult(result, json) {
@@ -79,7 +88,7 @@ function printResult(result, json) {
 }
 
 export async function main(argv = process.argv.slice(2)) {
-  const { command, text, options } = parseArgs(argv);
+  const { command, text, options, passthrough } = parseArgs(argv);
 
   if (command === 'help' || command === '--help' || command === '-h') {
     console.log(HELP);
@@ -97,6 +106,20 @@ export async function main(argv = process.argv.slice(2)) {
   if (command === 'tower') {
     console.log('404gent tower: runtime guardrail console is not implemented yet.');
     return 0;
+  }
+
+  async function recordReport(report) {
+    await appendAuditEvent(report, config);
+    await appendVectorDocument(report, config);
+    await updateState(report, config);
+  }
+
+  if (command === 'run') {
+    const result = await runGuardedCommand(passthrough.length > 0 ? passthrough : text.split(' ').filter(Boolean), {
+      config,
+      recordReport
+    });
+    return result.exitCode;
   }
 
   const surfaces = {
@@ -149,9 +172,7 @@ export async function main(argv = process.argv.slice(2)) {
       };
     }
 
-    await appendAuditEvent(result, config);
-    await appendVectorDocument(result, config);
-    await updateState(result, config);
+    await recordReport(result);
     printResult(result, options.json);
     return result.decision === 'block' ? 1 : 0;
   }
@@ -169,9 +190,7 @@ export async function main(argv = process.argv.slice(2)) {
       scannedAt: result.scannedAt
     };
   }
-  await appendAuditEvent(result, config);
-  await appendVectorDocument(result, config);
-  await updateState(result, config);
+  await recordReport(result);
   printResult(result, options.json);
   return result.decision === 'block' ? 1 : 0;
 }
