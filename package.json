@@ -17,6 +17,7 @@
     "demo:cmux-native": "bash scripts/cmux-native-demo.sh",
     "demo:agents": "bash scripts/cmux-agent-demo.sh",
     "tower": "node src/cli.js tower",
+    "dashboard": "node src/dashboard.js",
     "bench": "node scripts/benchmark.js",
     "self-loop": "node scripts/self-loop.js"
   },
