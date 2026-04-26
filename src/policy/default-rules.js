@@ -35,6 +35,24 @@ export const defaultRules = [
     remediation: 'Block downstream tool use and preserve image hash plus extracted text for review.'
   },
   {
+    id: 'llm-injection-attempt',
+    appliesTo: ['llm'],
+    severity: 'high',
+    category: 'prompt_injection',
+    pattern: '\\b(?:ignore|disregard|forget|override)\\b.{0,80}\\b(?:previous|prior|above|all)\\b.{0,60}\\b(?:instructions?|rules?|policy|context|system)\\b',
+    rationale: 'LLM output contains a prompt injection pattern targeting prior instructions.',
+    remediation: 'Do not forward this output to another agent; flag it as a handoff poisoning attempt.'
+  },
+  {
+    id: 'llm-guardrail-disable-attempt',
+    appliesTo: ['llm'],
+    severity: 'critical',
+    category: 'guardrail_tampering',
+    pattern: '\\b(?:disable|remove|bypass|shutdown|turn off)\\b.{0,80}\\b(?:guardrail|scanner|policy|404gent|safety|monitor|hook)\\b',
+    rationale: 'LLM output attempts to disable runtime guardrails or safety monitors.',
+    remediation: remediation.llm
+  },
+  {
     id: 'llm-memory-poisoning',
     appliesTo: ['llm'],
     severity: 'high',

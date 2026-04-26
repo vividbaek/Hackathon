@@ -21,10 +21,15 @@
     "demo:image": "node scripts/generate-attack-image.js",
     "tower": "node src/cli.js tower",
     "dashboard": "node src/dashboard.js",
+    "agents": "node scripts/run-agents.js",
     "bench": "node scripts/benchmark.js",
     "self-loop": "node scripts/self-loop.js"
   },
   "engines": {
     "node": ">=20"
+  },
+  "dependencies": {
+    "sharp": "^0.34.5",
+    "tesseract.js": "^7.0.0"
   }
 }
