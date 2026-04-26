@@ -114,17 +114,17 @@ function dashboardAgentId(e) {
 
 const threeAgentRunbook = [
   { id:'agent-vision-sentinel', label:'Agent 1 · Vision Sentinel', icon:'👁',
-    objective:'이미지·스크린샷·OCR 결과에서 숨겨진 prompt injection과 의심 영역을 탐지합니다.',
+    objective:'Detect hidden prompt injections and suspicious regions in images, screenshots, and OCR results.',
     inputs:'image file, screenshot, OCR text, VLM regions',
     outputs:'extractedText, hiddenPrompts, regions, objects, confidence',
     command:'node src/cli.js scan-image --file <image-path>' },
   { id:'agent-policy-arbiter',  label:'Agent 2 · Policy Arbiter',  icon:'🛡',
-    objective:'Vision Sentinel이 넘긴 텍스트와 증거를 룰베이스와 Claude review로 판정합니다.',
+    objective:'Evaluate text and evidence from Vision Sentinel with rule-based checks and Claude review.',
     inputs:'prompt, image, vision_observation, llm, command, output events',
     outputs:'allow / warn / block, findings, remediation',
     command:'node src/cli.js scan-image "<VLM extracted text>"' },
   { id:'agent-rule-steward',    label:'Agent 3 · Rule Steward',    icon:'⚙',
-    objective:'차단·경고 로그를 포렌식 증거로 묶고 30분 self-loop 룰 후보를 생성합니다.',
+    objective:'Bundle blocked and warning logs into forensic evidence and generate 30-minute self-loop rule candidates.',
     inputs:'.404gent/events.jsonl, .404gent/vectors.jsonl',
     outputs:'rule-candidates.json, replay corpus, policy diff',
     command:'npm run self-loop' }
@@ -173,15 +173,15 @@ function agentTask(id, events, candidates) {
   const n = events.length;
   if (id === 'vision-agent') {
     const h = events.some(e => (e.event?.evidence?.hiddenPrompts ?? []).length > 0);
-    if (h) return '숨겨진 프롬프트 인젝션 발견';
-    return n > 0 ? '이미지 추출 텍스트 분석 중' : '이미지 스캔 대기 중';
+    if (h) return 'Hidden prompt injection found';
+    return n > 0 ? 'Analyzing extracted image text' : 'Image scan idle';
   }
-  if (id === 'policy-agent') return n > 0 ? '정책 룰 적용 중' : '가드레일 이벤트 대기 중';
-  if (id === 'llm-review-agent') return n > 0 ? '모호한 컨텍스트 Claude 검토 중' : '에스컬레이션 대기 중';
-  if (id === 'forensic-agent') return n > 0 ? '감사 로그 및 증거 기록 중' : '최근 증거 없음';
-  if (id === 'rule-agent') return candidates.length > 0 ? '정책 룰 후보 생성 중' : '대기 중인 룰 후보 없음';
-  if (id === 'supervisor-agent') return events.some(e => e.decision === 'block') ? '위험 워크플로우 차단 중' : '판정 모니터링 중';
-  return '대기 중';
+  if (id === 'policy-agent') return n > 0 ? 'Applying policy rules' : 'Guardrail events idle';
+  if (id === 'llm-review-agent') return n > 0 ? 'Reviewing ambiguous context with Claude' : 'Escalation idle';
+  if (id === 'forensic-agent') return n > 0 ? 'Recording audit logs and evidence' : 'No recent evidence';
+  if (id === 'rule-agent') return candidates.length > 0 ? 'Generating policy rule candidates' : 'No active rule candidates';
+  if (id === 'supervisor-agent') return events.some(e => e.decision === 'block') ? 'Blocking risky workflow' : 'Monitoring decisions';
+  return 'Idle';
 }
 
 function collectAlerts(events) {
@@ -220,7 +220,7 @@ function collectHiddenPromptDiscoveries(events) {
 }
 
 function computeSafetyScore(events, candidates) {
-  if (events.length === 0) return { score: 100, level: 'safe', label: '안전' };
+  if (events.length === 0) return { score: 100, level: 'safe', label: 'Safe' };
   const now = Date.now();
   const RECENCY = 5 * 60 * 1000;
   let penalty = 0;
@@ -233,7 +233,7 @@ function computeSafetyScore(events, candidates) {
   penalty += (Array.isArray(candidates) ? candidates.length : 0) * 3;
   const score = Math.max(0, Math.min(100, 100 - penalty));
   const level = score >= 80 ? 'safe' : score >= 50 ? 'caution' : score >= 20 ? 'danger' : 'critical';
-  const label = { safe: '안전', caution: '주의', danger: '위험', critical: '심각' }[level];
+  const label = { safe: 'Safe', caution: 'Caution', danger: 'Danger', critical: 'Critical' }[level];
   return { score, level, label };
 }
 
@@ -341,77 +341,85 @@ function collectTimeline(events, candidates) {
     .slice(0, 50);
 }
 
-function buildSessionFlow(sessionEvents, STAGE_ORDER) {
-  const stageMap = {};
-  let lastSeen = '';
-  for (const ev of sessionEvents) {
-    const surface = ev.surface ?? ev.event?.type ?? 'unknown';
-    const ts = ev.timestamp ?? ev.scannedAt ?? '';
-    if (ts > lastSeen) lastSeen = ts;
-    if (STAGE_ORDER.includes(surface)) {
-      if (!stageMap[surface] || ev.decision === 'block') {
-        stageMap[surface] = {
-          surface, decision: ev.decision, findings: ev.findings ?? [],
-          text: (ev.event?.text ?? ev.text ?? '').slice(0, 80),
-          timestamp: ts
-        };
-      }
-    }
+function guardLayerLabel(surface) {
+  return {
+    image: 'Vision Guard',
+    vision_observation: 'Vision Guard',
+    prompt: 'Prompt Guard',
+    llm: 'LLM Guard',
+    command: 'Command Guard',
+    output: 'Output Guard',
+    os: 'OS Guard'
+  }[surface] ?? `${surface} Guard`;
+}
+
+function taskOperation(ev) {
+  const event = ev.event ?? {};
+  const meta = event.meta ?? {};
+  const surface = ev.surface ?? event.type ?? 'unknown';
+  if (surface === 'os') {
+    if (meta.operation === 'open') return `open ${meta.path ?? ''}`.trim();
+    if (meta.operation === 'unlink') return `unlink ${meta.path ?? ''}`.trim();
+    if (meta.operation === 'exec') return (meta.argv ?? []).join(' ') || meta.executable || 'exec';
+    return meta.operation ?? 'os event';
   }
-  const stages = STAGE_ORDER.filter(s => stageMap[s]).map(s => stageMap[s]);
-  const blockStage = stages.find(s => s.decision === 'block');
-  const overallDecision = blockStage ? 'block'
-    : stages.some(s => s.decision === 'warn') ? 'warn'
-    : stages.length > 0 ? 'allow' : 'idle';
-  return { stages, blockStage: blockStage?.surface ?? null, overallDecision, lastSeen: lastSeen || null, eventCount: sessionEvents.length };
+  if (surface === 'command') return event.text ?? ev.text ?? 'command';
+  if (surface === 'output') return `output: ${event.text ?? ev.text ?? ''}`;
+  if (surface === 'prompt') return `prompt: ${event.text ?? ev.text ?? ''}`;
+  if (surface === 'image' || surface === 'vision_observation') {
+    return event.evidence?.imagePath ? `image ${event.evidence.imagePath}` : `image: ${event.text ?? ev.text ?? ''}`;
+  }
+  if (surface === 'llm') return `llm: ${event.text ?? ev.text ?? ''}`;
+  return event.text ?? ev.text ?? surface;
+}
+
+function taskFromEvent(ev) {
+  const event = ev.event ?? {};
+  const surface = ev.surface ?? event.type ?? 'unknown';
+  const findings = ev.findings ?? [];
+  return {
+    id: ev.id,
+    timestamp: eventTime(ev),
+    operation: taskOperation(ev),
+    surface,
+    layer: guardLayerLabel(surface),
+    decision: ev.decision ?? 'allow',
+    findings,
+    ruleId: findings[0]?.id ?? '',
+    severity: findings[0]?.severity ?? '',
+    pid: event.meta?.pid,
+    path: event.meta?.path,
+    text: event.text ?? ev.text ?? ''
+  };
 }
 
 function buildAgentFlows(events) {
   const ROLES = ['runtime', 'qa', 'backend', 'security'];
-  const STAGE_ORDER = ['image', 'vision_observation', 'prompt', 'llm', 'command', 'os', 'output'];
   const RECENT_MS = 5 * 60 * 1000;
   const now = Date.now();
-  const flows = [];
-
-  // Runtime hooks: split into per-session (per-terminal) flows
-  const runtimeEvents = events.filter(e => dashboardAgentId(e) === RUNTIME_HOOK_AGENT_ID);
-  const bySession = {};
-  for (const ev of runtimeEvents) {
-    const sid = ev.event?.meta?.sessionId ?? 'default';
-    if (!bySession[sid]) bySession[sid] = [];
-    bySession[sid].push(ev);
-  }
-  const sessionEntries = Object.entries(bySession)
-    .map(([sid, evts]) => {
-      const lastTs = evts.reduce((m, e) => { const ts = e.timestamp ?? e.scannedAt ?? ''; return ts > m ? ts : m; }, '');
-      return { sid, evts, lastTs };
-    })
-    .sort((a, b) => b.lastTs.localeCompare(a.lastTs));
-
-  for (const { sid, evts } of sessionEntries) {
-    const flow = buildSessionFlow(evts, STAGE_ORDER);
-    const shortSid = sid.length > 8 ? sid.slice(0, 8) : sid;
-    const isRecent = evts.some(e => now - Date.parse(e.timestamp ?? e.scannedAt ?? '') < RECENT_MS);
-    flows.push({
-      role: 'runtime', agentId: RUNTIME_HOOK_AGENT_ID,
-      sessionId: sid, shortSessionId: shortSid, isPerSession: true, isRecent,
-      ...flow, sessionCount: 1, recentSessionCount: isRecent ? 1 : 0
-    });
-  }
-
-  // Other LLM agent roles: only include if they have actual events
-  for (const role of ROLES.filter(r => r !== 'runtime')) {
-    const agentId = `agent-${role}`;
-    const agentEvents = events.filter(e => dashboardAgentId(e) === agentId);
-    if (agentEvents.length === 0) continue;
-    const flow = buildSessionFlow(agentEvents, STAGE_ORDER);
-    flows.push({
-      role, agentId, isPerSession: false,
-      ...flow, sessionCount: 1, recentSessionCount: 1
-    });
-  }
-
-  return flows;
+  return ROLES.map(role => {
+    const agentId = role === 'runtime' ? RUNTIME_HOOK_AGENT_ID : `agent-${role}`;
+    const agentEvents = events
+      .filter(e => dashboardAgentId(e) === agentId)
+      .sort((a, b) => Date.parse(eventTime(b) ?? '') - Date.parse(eventTime(a) ?? ''));
+    const bySession = {};
+    for (const ev of agentEvents) {
+      const sid = ev.event?.meta?.sessionId ?? 'default';
+      if (!bySession[sid]) bySession[sid] = [];
+      bySession[sid].push(ev);
+    }
+    const sessionCount = Object.keys(bySession).length;
+    const recentSessionCount = Object.values(bySession).filter(evts =>
+      evts.some(e => now - Date.parse(e.timestamp ?? e.scannedAt ?? '') < RECENT_MS)
+    ).length;
+    const tasks = agentEvents.slice(0, 8).map(taskFromEvent);
+    const overallDecision = tasks.some(t => t.decision === 'block') ? 'block'
+      : tasks.some(t => t.decision === 'warn') ? 'warn'
+      : tasks.length > 0 ? 'allow' : 'idle';
+    return { role, agentId, overallDecision, tasks,
+      eventCount: agentEvents.length, lastSeen: agentEvents[0] ? eventTime(agentEvents[0]) : null,
+      sessionCount, recentSessionCount };
+  });
 }
 
 function buildVisionFlow(events) {
@@ -651,7 +659,7 @@ export async function startDashboardServer({ port = DEFAULT_PORT, dataDir = '.40
     });
     if (result) return result;
   }
-  throw new Error(`포트 ${port}–${MAX_PORT} 사이에 사용 가능한 포트가 없습니다.`);
+  throw new Error(`No available port between ${port} and ${MAX_PORT}.`);
 }
 
 // ─── HTML ──────────────────────────────────────────────────────────────────────
@@ -661,7 +669,7 @@ function renderHtml() {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>404gent · 에이전트 런타임</title>
+<title>404gent · Agent Runtime</title>
 <style>
 :root{
   --bg:#f0f2f7;--panel:#fff;--ink:#111827;--muted:#6b7280;--border:#e5e7eb;
@@ -673,7 +681,7 @@ function renderHtml() {
 *{box-sizing:border-box;margin:0;padding:0;}
 body{font-family:"Pretendard Variable",ui-sans-serif,system-ui,-apple-system,"Apple SD Gothic Neo","Noto Sans KR",sans-serif;background:var(--bg);color:var(--ink);font-size:14px;line-height:1.5;}
 
-/* ── 헤더 ── */
+/* Header */
 header{position:sticky;top:0;z-index:100;background:var(--hdr);display:flex;align-items:stretch;border-bottom:1px solid var(--hdr-border);height:58px;}
 .brand{display:flex;align-items:center;gap:10px;padding:0 20px;border-right:1px solid var(--hdr-border);min-width:200px;}
 .brand-icon{font-size:24px;line-height:1;}
@@ -689,7 +697,7 @@ nav.tabs{display:flex;align-items:stretch;flex:1;padding:0 6px;}
 .dot.err{background:var(--block);}
 @keyframes blink{0%,100%{opacity:1;}50%{opacity:.25;}}
 
-/* ── 지표 바 ── */
+/* Metrics bar */
 #metrics-bar{display:flex;background:var(--panel);border-bottom:1px solid var(--border);overflow-x:auto;}
 .metric{display:flex;flex-direction:column;align-items:center;padding:10px 22px;border-right:1px solid var(--border);min-width:96px;}
 .metric:last-child{border-right:none;}
@@ -700,32 +708,32 @@ nav.tabs{display:flex;align-items:stretch;flex:1;padding:0 6px;}
 .metric.m-allow strong{color:var(--allow);}
 .metric.m-inject strong{color:var(--inject);}
 
-/* ── 탭 패널 ── */
+/* Tab panels */
 .tab-panel{display:none;}.tab-panel.active{display:block;}
 
-/* ── 개요 레이아웃 ── */
+/* Overview layout */
 .ov-wrap{display:grid;grid-template-columns:1fr 370px;gap:16px;padding:16px;max-width:1620px;margin:0 auto;}
 .ov-main{display:flex;flex-direction:column;gap:16px;}
 .ov-side{display:flex;flex-direction:column;gap:14px;}
 
-/* ── 패널 ── */
+/* Panels */
 .panel{background:var(--panel);border:1px solid var(--border);border-radius:var(--r);overflow:hidden;}
 .panel-hd{display:flex;align-items:center;justify-content:space-between;padding:14px 16px 0;margin-bottom:10px;}
 .panel-hd h2{font-size:12px;font-weight:800;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);}
 .panel-bd{padding:0 16px 16px;}
 
-/* ── 에이전트 그래프 ── */
+/* Agent graph */
 .graph-scroll{overflow-x:auto;padding:0 16px 16px;}
 svg.graph{display:block;width:100%;min-width:960px;height:310px;}
 
-/* SVG 에지 */
+/* SVG edges */
 .g-edge{stroke:#d1d5db;stroke-width:1.5;fill:none;marker-end:url(#arr);}
 .g-edge.active{stroke:var(--accent);stroke-width:2;stroke-dasharray:7 4;animation:flow .9s linear infinite;}
 .g-edge.block-e{stroke:var(--block);stroke-width:2.5;stroke-dasharray:6 3;animation:flow .55s linear infinite;}
 .g-edge.warn-e{stroke:var(--warn);stroke-width:2;stroke-dasharray:6 4;animation:flow .75s linear infinite;}
 @keyframes flow{from{stroke-dashoffset:22;}to{stroke-dashoffset:0;}}
 
-/* SVG 노드 */
+/* SVG nodes */
 .g-node rect{fill:var(--panel);stroke:#cbd5e1;stroke-width:1.5;rx:10;}
 .g-node.allow rect{stroke:var(--allow);stroke-width:2.5;}
 .g-node.warn rect{stroke:var(--warn);stroke-width:3;filter:drop-shadow(0 0 6px rgba(217,119,6,.35));}
@@ -739,7 +747,7 @@ svg.graph{display:block;width:100%;min-width:960px;height:310px;}
 .g-ind.warn,.g-ind.block{animation:ind-pulse 1.2s ease-in-out infinite;}
 @keyframes ind-pulse{0%,100%{opacity:1;}50%{opacity:.3;}}
 
-/* ── 에이전트 카드 ── */
+/* Agent cards */
 .ag-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;padding:0 16px 16px;}
 .ag-card{border:1px solid var(--border);border-radius:9px;padding:13px;display:flex;flex-direction:column;gap:4px;transition:border-color .2s,background .2s,box-shadow .2s;}
 .ag-card.allow{border-color:var(--allow);background:#f0fdf4;}
@@ -773,7 +781,7 @@ svg.graph{display:block;width:100%;min-width:960px;height:310px;}
 .badge-unknown{background:#f3f4f6;color:#6b7280;}
 .badge-agent{background:#fce7f3;color:#9d174d;}
 
-/* ── 사이드바 ── */
+/* Sidebar */
 .side-sec{background:var(--panel);border:1px solid var(--border);border-radius:var(--r);}
 .side-sec.inject-sec{border-color:var(--inject);}
 .side-hd{padding:12px 14px 0;margin-bottom:8px;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);}
@@ -803,7 +811,7 @@ svg.graph{display:block;width:100%;min-width:960px;height:310px;}
 .feed-ts{font-size:10px;color:var(--muted);}
 .feed-txt{font-size:11px;color:var(--muted);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 
-/* ── 히스토리 탭 ── */
+/* History tab */
 .hist-wrap{padding:16px;max-width:1300px;margin:0 auto;}
 .hist-toolbar{display:flex;align-items:center;gap:12px;background:var(--panel);border:1px solid var(--border);border-radius:var(--r);padding:12px 16px;margin-bottom:14px;flex-wrap:wrap;}
 .tb-grp{display:flex;align-items:center;gap:6px;}
@@ -833,18 +841,7 @@ select{border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-si
 .tl-inject strong{color:var(--inject);font-size:10px;text-transform:uppercase;letter-spacing:.05em;display:block;margin-bottom:5px;}
 .tl-inject code{color:var(--inject);word-break:break-all;}
 
-/* ── 이미지 업로드 ── */
-@keyframes spin{from{transform:rotate(0deg);}to{transform:rotate(360deg);}}
-#drop-zone{border:2px dashed var(--border);border-radius:8px;padding:40px 20px;text-align:center;cursor:pointer;transition:border-color .2s,background .2s;}
-#drop-zone.dragover{border-color:var(--accent);background:#eef2ff;}
-#drop-zone.uploading{opacity:.5;pointer-events:none;}
-.upload-result-card{border:2px solid var(--border);border-radius:8px;padding:14px;margin-top:8px;}
-.upload-result-card.block{border-color:var(--block);background:#fef2f2;}
-.upload-result-card.warn{border-color:var(--warn);background:#fffbeb;}
-.upload-result-card.allow{border-color:var(--allow);background:#f0fdf4;}
-.upload-spinner{width:20px;height:20px;border:3px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin 1s linear infinite;display:inline-block;}
-
-/* ── 이미지 포렌식 탭 ── */
+/* Image Forensics tab */
 .foren-wrap{padding:16px;max-width:1300px;margin:0 auto;display:flex;flex-direction:column;gap:16px;}
 .img-card{background:var(--panel);border:1px solid var(--border);border-radius:var(--r);overflow:hidden;}
 .img-card-hd{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--border);flex-wrap:wrap;gap:8px;}
@@ -867,7 +864,7 @@ select{border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-si
 .finding-row{display:flex;align-items:baseline;gap:6px;font-size:11px;padding:5px 0;border-bottom:1px solid var(--border);}
 .finding-row:last-child{border-bottom:none;}
 
-/* ── 룰 엔진 탭 ── */
+/* Rule Engine tab */
 .rule-wrap{padding:16px;max-width:1400px;margin:0 auto;display:flex;flex-direction:column;gap:16px;}
 .rb-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;}
 .rb-card{background:var(--panel);border:1px solid var(--border);border-radius:var(--r);padding:16px;}
@@ -886,7 +883,7 @@ select{border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-si
 .surf-card strong{display:block;font-size:22px;font-weight:800;margin-top:6px;}
 .surf-card span{font-size:11px;color:var(--muted);}
 
-/* ── 공통 ── */
+/* Shared */
 .empty{font-size:12px;color:var(--muted);padding:12px 0;}
 code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;}
 .lbl-sm{font-size:10px;font-weight:800;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px;display:block;}
@@ -901,39 +898,16 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
   nav.tabs .tab-btn{padding:0 10px;font-size:12px;}
 }
 
-/* ── 새 개요 레이아웃 ── */
+/* Updated overview layout */
 .ov-new-wrap{padding:16px;display:flex;flex-direction:column;gap:16px;}
 .ov-section{}
 .afc-empty{padding:24px;text-align:center;color:var(--muted);font-size:13px;}
 
-/* ── 5-Layer Overview ── */
-.layer-overview-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;padding:16px;}
-@media(max-width:1100px){.layer-overview-grid{grid-template-columns:repeat(3,1fr);}}
-@media(max-width:680px){.layer-overview-grid{grid-template-columns:1fr;}}
-.layer-card{border:2px solid var(--border);border-radius:var(--r);padding:14px;background:#fff;display:flex;flex-direction:column;gap:6px;transition:border-color .2s,box-shadow .2s;}
-.layer-card.has-block{border-color:#fca5a5;background:#fef2f2;}
-.layer-card.has-warn{border-color:#fcd34d;background:#fffbeb;}
-.layer-card.active{border-color:#6ee7b7;background:#f0fdf4;}
-.layer-card-hd{display:flex;align-items:center;gap:8px;}
-.layer-card-icon{font-size:22px;line-height:1;}
-.layer-card-name{font-size:13px;font-weight:800;color:var(--ink);}
-.layer-card-id{font-size:10px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.04em;}
-.layer-stats{display:flex;gap:10px;margin-top:4px;}
-.layer-stat{text-align:center;flex:1;}
-.layer-stat-val{font-size:20px;font-weight:800;line-height:1.1;}
-.layer-stat-val.block{color:var(--block);}
-.layer-stat-val.warn{color:var(--warn);}
-.layer-stat-lbl{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;}
-.layer-meta{font-size:10px;color:var(--muted);margin-top:2px;display:flex;flex-direction:column;gap:2px;}
-.layer-meta code{font-size:9px;background:#f3f4f6;padding:1px 4px;border-radius:3px;}
-.layer-cand{display:inline-flex;align-items:center;gap:4px;font-size:10px;color:var(--inject);font-weight:700;}
-.layer-cand-dot{width:6px;height:6px;border-radius:50%;background:var(--inject);animation:blink 2s infinite;}
-
-/* 3-에이전트 병렬 그리드 */
+/* 3-agent parallel grid */
 .agent-flows-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;padding:16px;}
 @media(max-width:900px){.agent-flows-grid{grid-template-columns:1fr;}}
 
-/* 에이전트 컬럼 */
+/* Agent columns */
 .afc-col{border:2px solid var(--border);border-radius:var(--r);overflow:hidden;background:#fff;}
 .afc-col.warn{border-color:#fcd34d;}
 .afc-col.allow{border-color:#6ee7b7;}
@@ -943,10 +917,23 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
 .afc-name{font-size:13px;font-weight:700;color:var(--ink);}
 .afc-sub{font-size:11px;color:var(--muted);margin-top:1px;}
 .afc-status{margin-left:auto;flex-shrink:0;}
-.afc-pipeline{padding:14px 12px;display:flex;flex-direction:column;align-items:stretch;gap:0;}
+.afc-pipeline{padding:10px 10px;display:flex;flex-direction:column;align-items:stretch;gap:8px;max-height:300px;overflow:auto;}
 .afc-meta{padding:8px 14px;font-size:11px;color:var(--muted);border-top:1px solid var(--border);background:var(--bg);}
 
-/* 파이프라인 노드 */
+/* Agent task logs */
+.task-row{display:grid;grid-template-columns:56px minmax(0,1fr) auto;gap:8px;align-items:start;border:1px solid var(--border);border-left-width:4px;border-radius:8px;background:#fff;padding:8px 10px;}
+.task-row.allow{border-left-color:var(--allow);}
+.task-row.warn{border-left-color:var(--warn);background:#fffbeb;}
+.task-row.block{border-left-color:var(--block);background:#fff1f2;}
+.task-ts{font-size:11px;color:var(--muted);white-space:nowrap;padding-top:2px;}
+.task-main{min-width:0;display:flex;flex-direction:column;gap:4px;}
+.task-op code{font-size:11px;background:transparent;word-break:break-all;color:var(--ink);font-weight:700;}
+.task-meta{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:10px;color:var(--muted);}
+.task-pid{font-size:10px;color:var(--muted);}
+.task-rule{display:flex;align-items:center;gap:6px;min-width:0;}
+.task-rule code{font-size:10px;color:#991b1b;background:transparent;font-weight:700;word-break:break-all;}
+
+/* Pipeline nodes */
 .pf-node{border:1.5px solid var(--border);border-radius:8px;padding:10px 12px;background:#fff;position:relative;}
 .pf-node.allow{border-color:#6ee7b7;background:#f0fdf4;}
 .pf-node.warn{border-color:#fcd34d;background:#fffbeb;}
@@ -962,7 +949,7 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
 .pf-rationale{margin-top:2px;color:#991b1b;font-size:10px;line-height:1.4;}
 .pf-arrow{text-align:center;color:#94a3b8;font-size:16px;line-height:1;padding:3px 0;}
 
-/* Vision 파이프라인 */
+/* Vision pipeline */
 .vision-flow-wrap{display:flex;align-items:flex-start;gap:0;padding:16px;overflow-x:auto;}
 .vf-stage{display:flex;flex-direction:column;align-items:center;min-width:150px;}
 .vf-node{border:2px solid var(--border);border-radius:10px;padding:12px 14px;background:#fff;text-align:center;width:140px;}
@@ -977,14 +964,14 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
 .vf-hidden-prompts code{font-size:10px;color:#6b21a8;display:block;margin-top:2px;word-break:break-all;}
 .vf-empty{padding:20px 16px;color:var(--muted);font-size:12px;}
 
-/* 알림 행 */
+/* Alert rows */
 .ov-alerts-row{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;}
 @media(max-width:900px){.ov-alerts-row{grid-template-columns:1fr;}}
 .ov-alerts-row .side-sec{background:var(--panel);border:1px solid var(--border);border-radius:var(--r);}
 .ov-alerts-row .side-hd{font-size:12px;font-weight:700;padding:10px 14px;border-bottom:1px solid var(--border);}
 .ov-alerts-row .side-bd{padding:8px;max-height:220px;overflow-y:auto;}
 
-/* ── Safety Score 게이지 ── */
+/* Safety score gauge */
 .risk-gauge{display:flex;flex-direction:column;align-items:center;padding:8px 24px;border-right:2px solid var(--border);min-width:100px;}
 .gauge-ring{width:52px;height:52px;border-radius:50%;display:flex;align-items:center;justify-content:center;position:relative;}
 .gauge-ring::after{content:'';width:38px;height:38px;border-radius:50%;background:var(--panel);position:absolute;}
@@ -992,7 +979,7 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
 .gauge-label{font-size:10px;text-transform:uppercase;letter-spacing:.06em;margin-top:4px;font-weight:700;}
 .gauge-safe{color:var(--allow);}.gauge-caution{color:var(--warn);}.gauge-danger{color:var(--block);}.gauge-critical{color:#7f1d1d;}
 
-/* ── 토스트 알림 ── */
+/* Toast alerts */
 #toast-container{position:fixed;top:66px;right:16px;z-index:200;display:flex;flex-direction:column;gap:8px;pointer-events:none;max-width:400px;}
 .toast{pointer-events:auto;background:#fff;border:2px solid var(--border);border-radius:10px;padding:14px 18px;box-shadow:0 8px 24px rgba(0,0,0,.12);animation:toast-in .3s ease-out,toast-out .3s ease-in 4.7s forwards;display:flex;align-items:flex-start;gap:12px;}
 .toast.block{border-color:var(--block);background:linear-gradient(135deg,#fef2f2,#fff);}
@@ -1008,7 +995,7 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
 @keyframes toast-in{from{opacity:0;transform:translateX(40px);}to{opacity:1;transform:translateX(0);}}
 @keyframes toast-out{from{opacity:1;}to{opacity:0;transform:translateY(-10px);}}
 
-/* ── 액션 배너 ── */
+/* Action banner */
 .action-banner{display:flex;align-items:center;gap:14px;padding:14px 20px;border-radius:var(--r);font-size:13px;font-weight:600;}
 .action-banner.critical{background:linear-gradient(90deg,#fef2f2,#fff1f2);border:2px solid var(--block);color:#991b1b;}
 .action-banner.warning{background:linear-gradient(90deg,#fffbeb,#fef3c7);border:2px solid var(--warn);color:#92400e;}
@@ -1020,7 +1007,7 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
 .action-banner-btn.primary{background:var(--block);color:#fff;}.action-banner-btn.primary:hover{background:#b91c1c;}
 .action-banner-btn.secondary{background:#fff;border:1px solid var(--border);color:var(--ink);}
 
-/* ── 히스토리 에이전트 서브탭 ── */
+/* History agent subtabs */
 .hist-agent-tabs{display:flex;gap:4px;background:var(--panel);border:1px solid var(--border);border-radius:var(--r);padding:6px;margin-bottom:12px;}
 .hist-agent-tab{padding:8px 16px;border:none;background:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;color:var(--muted);transition:all .15s;font-family:inherit;}
 .hist-agent-tab:hover{background:#f1f5f9;color:var(--ink);}
@@ -1039,18 +1026,18 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
 .has-rules{margin-top:8px;font-size:11px;color:var(--muted);}
 .has-rules code{font-size:10px;background:#f3f4f6;padding:1px 4px;border-radius:3px;}
 
-/* ── 시간 그룹 ── */
+/* Time groups */
 .tl-group-header{display:flex;align-items:center;gap:10px;padding:8px 14px;margin:14px 0 6px;font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;border-bottom:1px solid var(--border);}
 .tl-group-blocks{color:var(--block);font-weight:800;}
 .tl-group-warns{color:var(--warn);font-weight:800;margin-left:4px;}
 
-/* ── block 강조 ── */
+/* Block emphasis */
 .tl-row.block{border-left:4px solid var(--block);background:#fef2f2;}
 .tl-row.block .tl-head{background:linear-gradient(90deg,#fef2f2,transparent 60%);}
 .tl-row.block.recent{animation:block-pulse 2s ease-in-out 3;}
 @keyframes block-pulse{0%,100%{box-shadow:inset 0 0 0 1px rgba(220,38,38,.15);}50%{box-shadow:inset 0 0 0 2px rgba(220,38,38,.4),0 0 12px rgba(220,38,38,.1);}}
 
-/* ── 에이전트 상세 확장 패널 ── */
+/* Agent detail expansion panel */
 .agent-detail-panel{grid-column:1/-1;background:var(--panel);border:2px solid var(--accent);border-radius:var(--r);padding:20px;animation:adp-slide .25s ease-out;}
 @keyframes adp-slide{from{opacity:0;max-height:0;}to{opacity:1;max-height:800px;}}
 .adp-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;}
@@ -1070,14 +1057,14 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
 .surf-bar-seg{height:100%;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;color:#fff;min-width:20px;}
 .adp-events{max-height:260px;overflow-y:auto;display:flex;flex-direction:column;gap:4px;margin-top:8px;}
 
-/* ── 에이전트 컬럼 block 글로우 ── */
+/* Agent column block glow */
 .afc-col.block{border-color:#fca5a5;animation:afc-block-glow 2s ease-in-out infinite;}
 @keyframes afc-block-glow{0%,100%{box-shadow:0 0 0 0 rgba(220,38,38,0);}50%{box-shadow:0 0 16px 4px rgba(220,38,38,.15);}}
 .afc-col{cursor:pointer;transition:transform .1s,box-shadow .15s;}
 .afc-col:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,.08);}
 .afc-mini-stats{display:flex;gap:8px;font-size:11px;font-weight:800;margin-top:4px;}
 
-/* ── 히스토리 에이전트 3분할 ── */
+/* History agent split layout */
 .hist-agent-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px;}
 @media(max-width:1000px){.hist-agent-grid{grid-template-columns:1fr;}}
 .hist-agent-col{background:var(--panel);border:1px solid var(--border);border-radius:var(--r);overflow:hidden;display:flex;flex-direction:column;}
@@ -1107,72 +1094,62 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
     <span class="brand-icon">⬡</span>
     <div>
       <h1>404gent</h1>
-      <p>멀티모달 AI 가드레일 런타임</p>
+      <p>Multimodal AI Guardrail Runtime</p>
     </div>
   </div>
   <nav class="tabs" id="tab-nav">
-    <button class="tab-btn active" data-tab="overview">개요</button>
-    <button class="tab-btn" data-tab="history">히스토리</button>
-    <button class="tab-btn" data-tab="forensics">이미지 포렌식</button>
-    <button class="tab-btn" data-tab="rules">룰 엔진</button>
+    <button class="tab-btn active" data-tab="overview">Overview</button>
+    <button class="tab-btn" data-tab="history">History</button>
+    <button class="tab-btn" data-tab="forensics">Image Forensics</button>
+    <button class="tab-btn" data-tab="rules">Rule Engine</button>
   </nav>
   <div class="live-badge">
     <span class="dot live" id="live-dot"></span>
-    <span id="updated">연결 중...</span>
+    <span id="updated">Connecting...</span>
   </div>
 </header>
 
 <div id="metrics-bar"></div>
 <div id="toast-container"></div>
 
-<!-- 개요 -->
+<!-- Overview -->
 <div class="tab-panel active" id="panel-overview">
   <div class="ov-new-wrap">
 
     <div id="action-banner" style="display:none;"></div>
 
-    <!-- 5-Layer Defense Overview -->
+    <!-- LLM agent pipeline -->
     <div class="panel ov-section">
       <div class="panel-hd">
-        <h2>🛡 5-Layer Defense <span style="font-size:12px;font-weight:400;color:var(--muted);">Prompt / Shell / ES / Output / Screen</span></h2>
-      </div>
-      <div id="layer-overview" class="layer-overview-grid">
-        <div class="afc-empty">이벤트를 수집하면 각 레이어 상태가 표시됩니다.</div>
-      </div>
-    </div>
-
-    <!-- LLM 에이전트 파이프라인 -->
-    <div class="panel ov-section">
-      <div class="panel-hd">
-        <h2>🤖 LLM 에이전트 파이프라인 <span style="font-size:12px;font-weight:400;color:var(--muted);">3개 에이전트 병렬 실행</span></h2>
+        <h2>🤖 LLM Agent Pipeline <span style="font-size:12px;font-weight:400;color:var(--muted);">3 agents running in parallel</span></h2>
       </div>
       <div id="agent-flows" class="agent-flows-grid">
-        <div class="afc-empty">에이전트를 실행하면 여기에 파이프라인이 표시됩니다.</div>
+        <div class="afc-empty">Run an agent to display task logs here.</div>
       </div>
     </div>
 
-    <!-- Vision 탐지 파이프라인 -->
+    <!-- Vision detection pipeline -->
     <div class="panel ov-section">
       <div class="panel-hd">
-        <h2>👁 Vision 이미지 탐지 파이프라인 <span style="font-size:12px;font-weight:400;color:var(--muted);">이미지 삽입 시 자동 탐지</span></h2>
+        <h2>👁 Vision Image Detection Pipeline <span style="font-size:12px;font-weight:400;color:var(--muted);">Automatic detection on image input</span></h2>
       </div>
       <div id="vision-flow">
-        <div class="afc-empty"><code>node src/cli.js scan-image --file &lt;이미지경로&gt;</code> 실행 시 탐지 결과가 표시됩니다.</div>
+        <div class="afc-empty"><code>node src/cli.js scan-image --file &lt;image-path&gt;</code> to display detection results.</div>
       </div>
     </div>
 
-    <!-- 사이드 알림 -->
+    <!-- Side alerts -->
     <div class="ov-alerts-row">
       <div class="side-sec inject-sec" id="disc-sec">
-        <div class="side-hd inject-hd">프롬프트 인젝션 탐지</div>
+        <div class="side-hd inject-hd">Prompt Injection Detection</div>
         <div class="side-bd" id="disc-list"></div>
       </div>
       <div class="side-sec">
-        <div class="side-hd">보안 알림</div>
+        <div class="side-hd">Security Alerts</div>
         <div class="side-bd" id="alert-list"></div>
       </div>
       <div class="side-sec">
-        <div class="side-hd">최근 활동</div>
+        <div class="side-hd">Recent Activity</div>
         <div class="side-bd" id="feed-list"></div>
       </div>
     </div>
@@ -1180,12 +1157,12 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
   </div>
 </div>
 
-<!-- 히스토리 -->
+<!-- History -->
 <div class="tab-panel" id="panel-history">
   <div class="hist-wrap">
     <div class="hist-agent-tabs" id="hist-agent-tabs">
-      <button class="hist-agent-tab active" data-agent="">전체 타임라인</button>
-      <!-- Runtime session tabs rendered dynamically -->
+      <button class="hist-agent-tab active" data-agent="">All Timeline</button>
+      <button class="hist-agent-tab" data-agent="claude-code-hook">🧩 Runtime Hook</button>
       <button class="hist-agent-tab" data-agent="agent-qa">🔍 QA Agent</button>
       <button class="hist-agent-tab" data-agent="agent-backend">⚙️ Backend Agent</button>
       <button class="hist-agent-tab" data-agent="agent-security">🛡 Security Agent</button>
@@ -1193,18 +1170,18 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
     <div class="hist-agent-summary" id="hist-agent-summary" style="display:none;"></div>
     <div class="hist-toolbar">
       <div class="tb-grp">
-        <label>판정</label>
+        <label>Decision</label>
         <select id="f-dec">
-          <option value="">전체</option>
-          <option value="block">차단</option>
-          <option value="warn">경고</option>
-          <option value="allow">허용</option>
+          <option value="">All</option>
+          <option value="block">Blocked</option>
+          <option value="warn">Warning</option>
+          <option value="allow">Allowed</option>
         </select>
       </div>
       <div class="tb-grp">
-        <label>서피스</label>
+        <label>Surface</label>
         <select id="f-surf">
-          <option value="">전체</option>
+          <option value="">All</option>
           <option value="image">image</option>
           <option value="vision_observation">vision_observation</option>
           <option value="prompt">prompt</option>
@@ -1215,13 +1192,13 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
         </select>
       </div>
       <div class="tb-grp">
-        <label>에이전트</label>
+        <label>Agent</label>
         <select id="f-agent">
-          <option value="">전체</option>
-          <!-- Runtime session options rendered dynamically -->
-          <option value="agent-qa">QA 에이전트</option>
-          <option value="agent-backend">Backend 에이전트</option>
-          <option value="agent-security">Security 에이전트</option>
+          <option value="">All</option>
+          <option value="claude-code-hook">Runtime Hook</option>
+          <option value="agent-qa">QA Agent</option>
+          <option value="agent-backend">Backend Agent</option>
+          <option value="agent-security">Security Agent</option>
         </select>
       </div>
       <span class="tb-count" id="hist-count"></span>
@@ -1230,7 +1207,7 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
   </div>
 </div>
 
-<!-- 이미지 포렌식 -->
+<!-- Image Forensics -->
 <div class="tab-panel" id="panel-forensics">
   <div class="foren-wrap">
     <div class="panel" id="upload-panel">
@@ -1255,19 +1232,19 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
   </div>
 </div>
 
-<!-- 룰 엔진 -->
+<!-- Rule Engine -->
 <div class="tab-panel" id="panel-rules">
   <div class="rule-wrap" id="rule-content"></div>
 </div>
 
 <script>
-// ── 상태 ──────────────────────────────────────────────────────────────────────
+// ── State ─────────────────────────────────────────────────────────────────────
 let lastModel = null;
 let activeTab = 'overview';
 let historyAgentFilter = '';
 let seenEventIds = new Set();
 
-const ST_LABEL = { idle:'대기', allow:'허용', warn:'경고', block:'차단' };
+const ST_LABEL = { idle:'Idle', allow:'Allowed', warn:'Warning', block:'Blocked' };
 const ST_EN    = { idle:'IDLE', allow:'ALLOW', warn:'WARN', block:'BLOCK' };
 const SEV_CLS  = { critical:'critical', high:'high', medium:'medium', low:'low' };
 const AGENT_LABEL = {'claude-code-hook':'Runtime Hook','agent-qa':'QA','agent-backend':'Backend','agent-security':'Security'};
@@ -1284,7 +1261,7 @@ function agentIdFor(e){return normalizeAgentId(e.event?.agentId??e.event?.meta?.
 function bdg(s){return '<span class="badge badge-'+h(s)+'">'+h(s)+'</span>';}
 function sevPill(s){return '<span class="sev '+h(SEV_CLS[s]||'low')+'">'+h(s)+'</span>';}
 
-// ── 탭 전환 ───────────────────────────────────────────────────────────────────
+// ── Tab switching ─────────────────────────────────────────────────────────────
 function switchToTab(tab){
   activeTab=tab;
   document.querySelectorAll('.tab-btn').forEach(b=>b.classList.toggle('active',b.dataset.tab===activeTab));
@@ -1302,7 +1279,7 @@ document.getElementById('f-surf').addEventListener('change',()=>{if(lastModel)re
 document.getElementById('f-agent').addEventListener('change',()=>{if(lastModel)renderHistory(lastModel);});
 document.addEventListener('click',e=>{const r=e.target.closest('.tl-row');if(r)r.classList.toggle('open');});
 
-// ── 히스토리 에이전트 서브탭 ───────────────────────────────────────────────────
+// ── History agent subtabs ────────────────────────────────────────────────────
 document.getElementById('hist-agent-tabs').addEventListener('click',e=>{
   const btn=e.target.closest('.hist-agent-tab');
   if(!btn)return;
@@ -1312,7 +1289,7 @@ document.getElementById('hist-agent-tabs').addEventListener('click',e=>{
   if(lastModel)renderHistory(lastModel);
 });
 
-// ── 에이전트 상세 클릭 ────────────────────────────────────────────────────────
+// ── Agent detail click handling ──────────────────────────────────────────────
 document.addEventListener('click',e=>{
   const col=e.target.closest('.afc-col[data-agent-id]');
   if(col){toggleAgentDetail(col.dataset.agentId);return;}
@@ -1322,9 +1299,9 @@ document.addEventListener('click',e=>{
   if(bannerBtn&&bannerBtn.dataset.tab){switchToTab(bannerBtn.dataset.tab);}
 });
 
-// ── 지표 + 게이지 ───────────────────────────────────────────────────────────────
+// ── Metrics and gauge ────────────────────────────────────────────────────────
 function renderMetrics(c, ss){
-  ss=ss||{score:100,level:'safe',label:'안전'};
+  ss=ss||{score:100,level:'safe',label:'Safe'};
   const gaugeColor=ss.level==='safe'?'var(--allow)':ss.level==='caution'?'var(--warn)':'var(--block)';
   const gaugeHtml='<div class="risk-gauge gauge-'+ss.level+'" style="--gauge-pct:'+ss.score+'">'+
     '<div class="gauge-ring" style="background:conic-gradient('+gaugeColor+' '+ss.score+'%,#e5e7eb '+ss.score+'%);">'+
@@ -1332,32 +1309,11 @@ function renderMetrics(c, ss){
     '</div>'+
     '<span class="gauge-label" style="color:'+gaugeColor+'">'+h(ss.label)+'</span>'+
   '</div>';
-  const items=[['전체',c.total,''],['차단',c.block,'m-block'],['경고',c.warn,'m-warn'],['허용',c.allow,'m-allow'],['룰 후보',c.candidates,''],['숨겨진 프롬프트',c.hiddenPrompts,'m-inject']];
+  const items=[['All',c.total,''],['Blocked',c.block,'m-block'],['Warning',c.warn,'m-warn'],['Allowed',c.allow,'m-allow'],['Rule Candidates',c.candidates,''],['Hidden Prompts',c.hiddenPrompts,'m-inject']];
   document.getElementById('metrics-bar').innerHTML=gaugeHtml+items.map(([l,v,cl])=>'<div class="metric '+cl+'"><strong>'+v+'</strong><span>'+l+'</span></div>').join('');
 }
 
-// ── 5-Layer Defense Overview ──────────────────────────────────────────────────
-function renderLayerOverview(model){
-  const layers=model.layerOverview||[];
-  const el=document.getElementById('layer-overview');
-  if(!layers.length){return;}
-  el.innerHTML=layers.map(ly=>{
-    const cls=ly.block>0?'has-block':ly.warn>0?'has-warn':ly.total>0?'active':'';
-    const candHtml=ly.candidateCount>0?'<div class="layer-cand"><span class="layer-cand-dot"></span>'+ly.candidateCount+'건 승인 대기</div>':'';
-    const ruleHtml=ly.topRule?'<div>Top 룰: <code>'+h(ly.topRule)+'</code>'+(ly.ruleCount>1?' 외 '+(ly.ruleCount-1)+'건':'')+'</div>':'';
-    return '<div class="layer-card '+cls+'">'+
-      '<div class="layer-card-hd"><span class="layer-card-icon">'+ly.icon+'</span><div><div class="layer-card-name">'+h(ly.label)+'</div><div class="layer-card-id">Layer: '+h(ly.id)+'</div></div></div>'+
-      '<div class="layer-stats">'+
-        '<div class="layer-stat"><div class="layer-stat-val block">'+ly.block+'</div><div class="layer-stat-lbl">차단</div></div>'+
-        '<div class="layer-stat"><div class="layer-stat-val warn">'+ly.warn+'</div><div class="layer-stat-lbl">경고</div></div>'+
-        '<div class="layer-stat"><div class="layer-stat-val">'+ly.total+'</div><div class="layer-stat-lbl">전체</div></div>'+
-      '</div>'+
-      '<div class="layer-meta">'+ruleHtml+candHtml+'</div>'+
-    '</div>';
-  }).join('');
-}
-
-// ── LLM 에이전트 3개 병렬 파이프라인 ─────────────────────────────────────────
+// ── Parallel LLM agent task logs ─────────────────────────────────────────────
 const ROLE_META={
   runtime: {label:'Runtime Hook',       icon:'🧩', sub:'Claude Code hook events'},
   qa:      {label:'Agent 1 · QA',       icon:'🔍', sub:'Frontend / Design QA'},
@@ -1365,13 +1321,12 @@ const ROLE_META={
   security:{label:'Agent 3 · Security',  icon:'🛡',  sub:'Security / Analyst'}
 };
 const STAGE_META={
-  image:             {icon:'🖼', label:'Screen Watch · Image'},
-  vision_observation:{icon:'👁', label:'Screen Watch · Vision'},
-  prompt:            {icon:'📝', label:'Prompt Guard'},
-  llm:               {icon:'🤖', label:'LLM 핸드오프'},
-  command:           {icon:'⚡', label:'Shell Guard'},
-  os:                {icon:'🔒', label:'ES Guard'},
-  output:            {icon:'📤', label:'Output Guard'}
+  image:             {icon:'🖼', label:'Image scanned'},
+  vision_observation:{icon:'👁', label:'Vision Analysis'},
+  prompt:            {icon:'📝', label:'Prompt Scan'},
+  llm:               {icon:'🤖', label:'LLM Handoff'},
+  command:           {icon:'⚡', label:'Command Execution'},
+  output:            {icon:'📤', label:'Output Inspection'}
 };
 function renderAgentFlows(model){
   const flows=(model.agentFlows||[]).filter(f=>f.eventCount>0);
@@ -1380,58 +1335,51 @@ function renderAgentFlows(model){
   document.getElementById('agent-flows').innerHTML=flows.map(flow=>{
     const m=ROLE_META[flow.role]||{label:flow.role,icon:'🤖',sub:''};
     const od=flow.overallDecision||'idle';
-    // Per-session runtime flows: compute stats from flow itself
-    const isRtSession=flow.isPerSession;
-    const flowBlock=flow.stages.filter(s=>s.decision==='block').length;
-    const flowWarn=flow.stages.filter(s=>s.decision==='warn').length;
-    const st=isRtSession?{block:flowBlock,warn:flowWarn}:(stats.find(s=>s.role===flow.role)||{block:0,warn:0});
-    const miniStats=(st.block>0?'<span style="color:var(--block);">'+st.block+' 차단</span>':'')+
-                    (st.warn>0?'<span style="color:var(--warn);">'+st.warn+' 경고</span>':'');
-    const stagesHtml=flow.stages.map((stage,i)=>{
-      const sm=STAGE_META[stage.surface]||{icon:'•',label:stage.surface};
-      const isBlock=stage.decision==='block';
-      const ruleId=isBlock&&stage.findings[0]?.id?stage.findings[0].id:'';
-      const rationale=isBlock&&stage.findings[0]?.rationale?stage.findings[0].rationale.slice(0,55):'';
-      const sevLabel=isBlock&&stage.findings[0]?.severity?sevPill(stage.findings[0].severity):'';
-      return (i>0?'<div class="pf-arrow">↓</div>':'')+
-        '<div class="pf-node '+stage.decision+'">'+
-          '<div class="pf-node-top">'+
-            '<span class="pf-node-icon">'+sm.icon+'</span>'+
-            '<span class="pf-node-label">'+h(sm.label)+'</span>'+
-            '<span class="pill sm '+stage.decision+'">'+ST_LABEL[stage.decision]+'</span>'+
-            sevLabel+
-          '</div>'+
-          (stage.text?'<div class="pf-text"><code>'+h(stage.text.slice(0,45))+'</code></div>':'')+
-          (isBlock?'<div class="pf-block-detail"><code>'+h(ruleId)+'</code><div class="pf-rationale">'+h(rationale)+'</div></div>':'')+
-        '</div>';
+    const st=stats.find(s=>s.role===flow.role)||{block:0,warn:0};
+    const miniStats=(st.block>0?'<span style="color:var(--block);">'+st.block+' Blocked</span>':'')+
+                    (st.warn>0?'<span style="color:var(--warn);">'+st.warn+' Warning</span>':'');
+    const tasksHtml=(flow.tasks||[]).map(task=>{
+      const firstFinding=task.findings?.[0]||{};
+      const decisionLabel=task.decision==='warn'?'Detected':ST_LABEL[task.decision]||task.decision;
+      const ruleHtml=firstFinding.id
+        ?'<div class="task-rule">'+sevPill(firstFinding.severity||'medium')+'<code>'+h(firstFinding.id)+'</code></div>'
+        :'';
+      const pidHtml=task.pid?'<span class="task-pid">pid '+h(task.pid)+'</span>':'';
+      return '<div class="task-row '+h(task.decision)+'">'+
+        '<div class="task-ts">'+fmt(task.timestamp)+'</div>'+
+        '<div class="task-main">'+
+          '<div class="task-op"><code>'+h((task.operation||'').slice(0,72))+'</code></div>'+
+          '<div class="task-meta">'+bdg(task.surface)+'<span>'+h(task.layer)+'</span>'+pidHtml+'</div>'+
+          ruleHtml+
+        '</div>'+
+        '<span class="pill sm '+h(task.decision)+'">'+h(decisionLabel)+'</span>'+
+      '</div>';
     }).join('');
-    // Label: per-session runtime shows session ID, others show role label
-    const label=isRtSession?m.label+' · '+h(flow.shortSessionId):h(m.label);
-    const sub=isRtSession?'터미널 세션 '+h(flow.shortSessionId):h(m.sub);
-    const recentDot=isRtSession&&flow.isRecent?'<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--allow);margin-left:6px;animation:blink 2s infinite;" title="활성 세션"></span>':'';
-    const dataId=isRtSession?(flow.agentId+':'+flow.sessionId):flow.agentId;
-    return '<div class="afc-col '+od+'" data-agent-id="'+h(dataId)+'">'+
+    const sessionBadge=flow.sessionCount>1
+      ?'<span title="'+flow.sessionCount+' sessions with recent task logs" style="font-size:10px;background:#e0e7ff;color:#4338ca;border-radius:4px;padding:1px 5px;margin-left:4px;">Sessions '+flow.sessionCount+(flow.recentSessionCount>1?' · '+flow.recentSessionCount+' active':'')+'</span>'
+      :'';
+    return '<div class="afc-col '+od+'" data-agent-id="'+flow.agentId+'">'+
       '<div class="afc-header">'+
         '<span class="afc-icon">'+m.icon+'</span>'+
         '<div><div class="afc-name">'+label+recentDot+'</div><div class="afc-sub">'+sub+'</div>'+(miniStats?'<div class="afc-mini-stats">'+miniStats+'</div>':'')+'</div>'+
         '<span class="afc-status pill '+od+'">'+ST_LABEL[od]+'</span>'+
       '</div>'+
-      '<div class="afc-pipeline">'+(stagesHtml||'<div class="afc-empty" style="padding:20px;font-size:12px;">미실행</div>')+'</div>'+
-      '<div class="afc-meta">이벤트 '+flow.eventCount+'건 · '+(flow.lastSeen?fmt(flow.lastSeen):'미실행')+'</div>'+
+      '<div class="afc-pipeline">'+(tasksHtml||'<div class="afc-empty" style="padding:20px;font-size:12px;">No task logs</div>')+'</div>'+
+      '<div class="afc-meta">Tasks '+flow.eventCount+' · '+(flow.lastSeen?fmt(flow.lastSeen):'Not run')+'</div>'+
     '</div>';
   }).join('');
 }
 
-// ── Vision 이미지 탐지 파이프라인 ─────────────────────────────────────────────
+// ── Vision Image Detection Pipeline ─────────────────────────────────────────────
 function renderVisionFlow(model){
   const vf=model.visionFlow;
   const el=document.getElementById('vision-flow');
-  if(!vf){el.innerHTML='<div class="vf-empty"><code>node src/cli.js scan-image --file &lt;이미지경로&gt;</code> 실행 시 탐지 결과가 표시됩니다. 데모: <code>npm run demo:image</code> → <code>node src/cli.js scan-image --file examples/generated/attack-image.svg</code></div>';return;}
+  if(!vf){el.innerHTML='<div class="vf-empty"><code>node src/cli.js scan-image --file &lt;image-path&gt;</code> to display detection results. Demo: <code>npm run demo:image</code> → <code>node src/cli.js scan-image --file examples/generated/attack-image.svg</code></div>';return;}
   const stages=[
-    {icon:'🖼',label:'이미지 업로드',detail:vf.imagePath?vf.imagePath.split('/').at(-1):'파일 없음',cls:''},
-    {icon:'👁',label:'OCR / VLM 분석',detail:'신뢰도: '+(vf.confidence!=null?(vf.confidence*100).toFixed(0)+'%':'—')+(vf.hiddenPrompts.length?' · 숨겨진 텍스트 '+(vf.hiddenPrompts.length)+'건':''),cls:vf.hiddenPrompts.length?'block':'allow'},
-    {icon:'🛡',label:'룰베이스 검사',detail:(vf.findings[0]?.id||'규칙 적용 완료'),cls:vf.decision},
-    {icon:vf.decision==='block'?'🚫':'✅',label:vf.decision==='block'?'차단':'허용',detail:vf.findings[0]?.rationale?.slice(0,50)||'',cls:vf.decision}
+    {icon:'🖼',label:'Image Upload',detail:vf.imagePath?vf.imagePath.split('/').at(-1):'No file',cls:''},
+    {icon:'👁',label:'OCR / VLM Analysis',detail:'Confidence: '+(vf.confidence!=null?(vf.confidence*100).toFixed(0)+'%':'—')+(vf.hiddenPrompts.length?' · hidden text '+(vf.hiddenPrompts.length)+'':''),cls:vf.hiddenPrompts.length?'block':'allow'},
+    {icon:'🛡',label:'Rule-based Check',detail:(vf.findings[0]?.id||'Rules applied'),cls:vf.decision},
+    {icon:vf.decision==='block'?'🚫':'✅',label:vf.decision==='block'?'Blocked':'Allowed',detail:vf.findings[0]?.rationale?.slice(0,50)||'',cls:vf.decision}
   ];
   const stagesHtml=stages.map((s,i)=>
     (i>0?'<div class="vf-connector">→</div>':'')+
@@ -1444,37 +1392,37 @@ function renderVisionFlow(model){
     '</div>'
   ).join('');
   const promptsHtml=vf.hiddenPrompts.length?
-    '<div class="vf-hidden-prompts"><strong>🔴 숨겨진 프롬프트 인젝션 ('+(vf.hiddenPrompts.length)+'건 발견)</strong>'+
+    '<div class="vf-hidden-prompts"><strong>🔴 Hidden Prompt Injection ('+(vf.hiddenPrompts.length)+' found)</strong>'+
     vf.hiddenPrompts.map(p=>'<code>'+h(p.slice(0,80))+'</code>').join('')+'</div>':'';
   const extractedHtml=vf.extractedText?
-    '<div style="padding:10px 16px 0;font-size:11px;color:var(--muted);">추출 텍스트: <code style="font-size:10px;">'+h(vf.extractedText.slice(0,100))+'</code></div>':'';
+    '<div style="padding:10px 16px 0;font-size:11px;color:var(--muted);">Extracted Text: <code style="font-size:10px;">'+h(vf.extractedText.slice(0,100))+'</code></div>':'';
   el.innerHTML='<div class="vision-flow-wrap">'+stagesHtml+'</div>'+promptsHtml+extractedHtml;
 }
 
-// ── 인젝션 탐지 사이드바 ──────────────────────────────────────────────────────
+// ── Injection detection sidebar ──────────────────────────────────────────────
 function renderDiscoveries(items){
   document.getElementById('disc-list').innerHTML=items.length
-    ?items.map(d=>'<div class="disc-card"><div class="disc-top"><span class="disc-title">인젝션 발견</span><span class="pill inject sm">숨겨진 프롬프트</span></div><div class="disc-meta">'+fmt(d.timestamp)+(d.imagePath?' · '+h(d.imagePath.split('/').at(-1)):'')+'</div><div class="disc-text"><code>'+h(d.prompt)+'</code></div></div>').join('')
-    :'<div class="empty">감지된 프롬프트 인젝션이 없습니다.</div>';
+    ?items.map(d=>'<div class="disc-card"><div class="disc-top"><span class="disc-title">Injection found</span><span class="pill inject sm">Hidden Prompts</span></div><div class="disc-meta">'+fmt(d.timestamp)+(d.imagePath?' · '+h(d.imagePath.split('/').at(-1)):'')+'</div><div class="disc-text"><code>'+h(d.prompt)+'</code></div></div>').join('')
+    :'<div class="empty">No prompt injections detected.</div>';
 }
 
-// ── 보안 알림 사이드바 ────────────────────────────────────────────────────────
+// ── Security alerts sidebar ──────────────────────────────────────────────────
 function renderAlerts(alerts){
   document.getElementById('alert-list').innerHTML=alerts.length
     ?alerts.slice(0,8).map(a=>'<div class="alert-card '+a.decision+'"><div class="alert-rule">'+h(a.ruleId)+'</div><div class="alert-meta">'+bdg(a.type)+sevPill(a.severity)+'<span>'+fmt(a.timestamp)+'</span></div><div style="margin-top:4px;"><code>'+h((a.match||'').slice(0,80))+'</code></div></div>').join('')
-    :'<div class="empty">보안 알림 없음.</div>';
+    :'<div class="empty">No security alerts.</div>';
 }
 
-// ── 최근 활동 피드 ────────────────────────────────────────────────────────────
+// ── Recent activity feed ─────────────────────────────────────────────────────
 function renderFeed(events){
-  const icons={block:'차단',warn:'경고',allow:'허용',idle:'•'};
+  const icons={block:'Blocked',warn:'Warning',allow:'Allowed',idle:'•'};
   document.getElementById('feed-list').innerHTML=events.slice(0,10).map(e=>{
     const d=e.decision||'idle';
     return '<div class="feed-item"><div class="feed-dot '+d+'">'+(d==='allow'?'✓':d==='block'?'✕':'!')+'</div><div class="feed-body"><div class="feed-row">'+bdg(surf(e))+'<span class="pill sm '+d+'">'+ST_LABEL[d]+'</span><span class="feed-ts">'+fmt(e.timestamp)+'</span></div><div class="feed-txt"><code>'+h((e.event?.text??e.text??'').slice(0,60))+'</code></div></div></div>';
-  }).join('')||'<div class="empty">이벤트 없음.</div>';
+  }).join('')||'<div class="empty">No events.</div>';
 }
 
-// ── 히스토리 탭 ───────────────────────────────────────────────────────────────
+// ── History tab ──────────────────────────────────────────────────────────────
 function groupByTimeWindow(events,windowMin){
   windowMin=windowMin||30;
   const groups=[];let cur=null;
@@ -1503,13 +1451,13 @@ function renderAgentSummaryHeader(agentId,events){
   el.innerHTML='<div class="has-icon">'+m.icon+'</div>'+
     '<div class="has-info"><div class="has-name">'+h(m.label)+' <span style="font-size:12px;font-weight:400;color:var(--muted);">'+h(m.sub)+'</span></div>'+
       '<div class="has-stats">'+
-        '<div class="has-stat"><div class="has-stat-val block">'+bk+'</div><div class="has-stat-lbl">차단</div></div>'+
-        '<div class="has-stat"><div class="has-stat-val warn">'+wn+'</div><div class="has-stat-lbl">경고</div></div>'+
-        '<div class="has-stat"><div class="has-stat-val allow">'+al+'</div><div class="has-stat-lbl">허용</div></div>'+
+        '<div class="has-stat"><div class="has-stat-val block">'+bk+'</div><div class="has-stat-lbl">Blocked</div></div>'+
+        '<div class="has-stat"><div class="has-stat-val warn">'+wn+'</div><div class="has-stat-lbl">Warning</div></div>'+
+        '<div class="has-stat"><div class="has-stat-val allow">'+al+'</div><div class="has-stat-lbl">Allowed</div></div>'+
       '</div>'+
-      (topRules.length?'<div class="has-rules">주요 룰: '+topRules.map(([r,n])=>'<code>'+h(r)+'</code>('+n+')').join(' · ')+'</div>':'')+
+      (topRules.length?'<div class="has-rules">Top rules: '+topRules.map(([r,n])=>'<code>'+h(r)+'</code>('+n+')').join(' · ')+'</div>':'')+
     '</div>'+
-    '<div class="has-rate"><div class="has-rate-val" style="color:'+(bk>0?'var(--block)':'var(--allow)')+'">'+rate+'%</div><div class="has-rate-lbl">차단율</div></div>';
+    '<div class="has-rate"><div class="has-rate-val" style="color:'+(bk>0?'var(--block)':'var(--allow)')+'">'+rate+'%</div><div class="has-rate-lbl">Block rate</div></div>';
 }
 
 function renderEventRow(e,now){
@@ -1524,8 +1472,8 @@ function renderEventRow(e,now){
   const sevBdg=topSev&&d==='block'?sevPill(topSev):'';
   const hPrompts=e.event?.evidence?.hiddenPrompts??[];
   const fRows=findings.map(f=>'<div class="tl-finding">'+sevPill(f.severity)+'<strong>'+h(f.id)+'</strong><span style="color:var(--muted);">'+h(f.rationale||'')+'</span></div>').join('');
-  const injSec=hPrompts.length?'<div class="tl-inject"><strong>숨겨진 프롬프트 원문 ('+hPrompts.length+'건)</strong>'+hPrompts.map(p=>'<code>'+h(p)+'</code>').join('<br>')+'</div>':'';
-  return '<div class="tl-row '+d+(recent?' recent':'')+'"><div class="tl-head"><span class="tl-ts">'+fmt(e.timestamp??e.recordedAt)+'</span><span class="tl-dec '+d+'">'+ST_LABEL[d]+'</span>'+sevBdg+bdg(s)+agentBdg+'<span class="tl-txt"><code>'+h(txt)+'</code></span><span class="tl-cnt">발견 '+findings.length+'건</span></div><div class="tl-detail"><div class="tl-detail-hd"><strong>이벤트 ID:</strong> '+h(e.id||'—')+' · <strong>에이전트:</strong> '+h(aid||'—')+' · <strong>시각:</strong> '+fmtFull(e.timestamp)+(e.event?.evidence?.imagePath?' · <strong>이미지:</strong> '+h(e.event.evidence.imagePath):'')+'</div>'+(fRows?'<div class="finding-list">'+fRows+'</div>':'')+injSec+'</div></div>';
+  const injSec=hPrompts.length?'<div class="tl-inject"><strong>Hidden Prompt Source ('+hPrompts.length+')</strong>'+hPrompts.map(p=>'<code>'+h(p)+'</code>').join('<br>')+'</div>':'';
+  return '<div class="tl-row '+d+(recent?' recent':'')+'"><div class="tl-head"><span class="tl-ts">'+fmt(e.timestamp??e.recordedAt)+'</span><span class="tl-dec '+d+'">'+ST_LABEL[d]+'</span>'+sevBdg+bdg(s)+agentBdg+'<span class="tl-txt"><code>'+h(txt)+'</code></span><span class="tl-cnt">found '+findings.length+'</span></div><div class="tl-detail"><div class="tl-detail-hd"><strong>Event ID:</strong> '+h(e.id||'—')+' · <strong>Agent:</strong> '+h(aid||'—')+' · <strong>Time:</strong> '+fmtFull(e.timestamp)+(e.event?.evidence?.imagePath?' · <strong>Image:</strong> '+h(e.event.evidence.imagePath):'')+'</div>'+(fRows?'<div class="finding-list">'+fRows+'</div>':'')+injSec+'</div></div>';
 }
 
 function renderAgentColumnInner(label,sub,icon,ae,now,maxRows){
@@ -1537,7 +1485,7 @@ function renderAgentColumnInner(label,sub,icon,ae,now,maxRows){
   const shown=ae.slice(0,cap);
   let rowsHtml='';
   if(!shown.length){
-    rowsHtml='<div class="hac-empty">이벤트가 없습니다.</div>';
+    rowsHtml='<div class="hac-empty">No events for this agent.</div>';
   } else {
     const groups=groupByTimeWindow(shown,30);
     for(const g of groups){
@@ -1546,22 +1494,24 @@ function renderAgentColumnInner(label,sub,icon,ae,now,maxRows){
         const gWn=g.events.filter(e=>e.decision==='warn').length;
         rowsHtml+='<div class="tl-group-header" style="font-size:10px;padding:3px 8px;">'+
           '<span>'+fmt(new Date(g.end).toISOString())+' ~ '+fmt(new Date(g.start).toISOString())+'</span>'+
-          '<span>'+g.events.length+'건</span>'+
-          (gBk?'<span class="tl-group-blocks">'+gBk+' 차단</span>':'')+
-          (gWn?'<span class="tl-group-warns">'+gWn+' 경고</span>':'')+
+          '<span>'+g.events.length+'</span>'+
+          (gBk?'<span class="tl-group-blocks">'+gBk+' Blocked</span>':'')+
+          (gWn?'<span class="tl-group-warns">'+gWn+' Warning</span>':'')+
         '</div>';
       }
       rowsHtml+=g.events.map(e=>renderEventRow(e,now)).join('');
     }
   }
+  const moreBtn=ae.length>shown.length
+    ?'<div class="hac-footer"><button onclick="document.querySelectorAll(\\'[data-agent=&quot;'+agentId+'&quot;]\\').forEach(b=>b.click())">+'+( ae.length-shown.length)+' more</button></div>':'';
   return '<div class="hist-agent-col '+borderCls+'">'+
     '<div class="hac-header">'+
       '<span class="hac-icon">'+icon+'</span>'+
       '<div class="hac-info"><div class="hac-name">'+h(label)+'</div><div class="hac-sub">'+h(sub)+'</div></div>'+
       '<div class="hac-stats">'+
-        (bk?'<div class="hac-stat block"><span class="hac-stat-n">'+bk+'</span>차단</div>':'')+
-        (wn?'<div class="hac-stat warn"><span class="hac-stat-n">'+wn+'</span>경고</div>':'')+
-        '<div class="hac-stat allow"><span class="hac-stat-n">'+al+'</span>허용</div>'+
+        (bk?'<div class="hac-stat block"><span class="hac-stat-n">'+bk+'</span>Blocked</div>':'')+
+        (wn?'<div class="hac-stat warn"><span class="hac-stat-n">'+wn+'</span>Warning</div>':'')+
+        '<div class="hac-stat allow"><span class="hac-stat-n">'+al+'</span>Allowed</div>'+
       '</div>'+
     '</div>'+
     '<div class="hac-body">'+rowsHtml+'</div>'+
@@ -1661,53 +1611,34 @@ function renderHistory(model){
 
   const preFiltered=events.filter(e=>(!fd||e.decision===fd)&&(!fs||surf(e)===fs));
 
-  // ── 전체 모드: 에이전트 분할 컬럼 (세션별) ──
+  // ── All mode: split by agent columns ───────────────────────────────────────
   if(!fa){
     renderAgentSummaryHeader('',events);
-    document.getElementById('hist-count').textContent='총 '+preFiltered.length+'건';
-    // Build per-session runtime columns
-    const rtEvents=preFiltered.filter(e=>agentIdFor(e)==='claude-code-hook');
-    const rtSessions={};
-    for(const e of rtEvents){const sid=sessionIdFor(e)||'default';if(!rtSessions[sid])rtSessions[sid]=[];rtSessions[sid].push(e);}
-    const rtSessionKeys=Object.keys(rtSessions).sort((a,b)=>{
-      const ta=rtSessions[a].reduce((m,e)=>{const ts=e.timestamp??'';return ts>m?ts:m;},'');
-      const tb=rtSessions[b].reduce((m,e)=>{const ts=e.timestamp??'';return ts>m?ts:m;},'');
-      return tb.localeCompare(ta);
-    });
-    const otherAgents=['agent-qa','agent-backend','agent-security'];
-    const knownIds=new Set(['claude-code-hook',...otherAgents]);
-    const unassigned=preFiltered.filter(e=>!knownIds.has(agentIdFor(e)));
-    let html='<div class="hist-agent-grid">';
-    // Runtime session columns
-    for(const sid of rtSessionKeys){
-      const short=sid.length>8?sid.slice(0,8):sid;
-      html+=renderAgentColumnForSession('claude-code-hook',rtSessions[sid],now,20,short);
-    }
-    if(!rtSessionKeys.length){
-      html+=renderAgentColumn('claude-code-hook',preFiltered,now,20);
-    }
-    html+=otherAgents.map(aid=>renderAgentColumn(aid,preFiltered,now,20)).join('');
-    html+='</div>';
+    document.getElementById('hist-count').textContent='Total '+preFiltered.length;
+    const agents=['claude-code-hook','agent-qa','agent-backend','agent-security'];
+    const unassigned=preFiltered.filter(e=>!agents.includes(agentIdFor(e)));
+    let html='<div class="hist-agent-grid">'+
+      agents.map(aid=>renderAgentColumn(aid,preFiltered,now,20)).join('')+
+    '</div>';
     if(unassigned.length){
-      html+='<div style="margin-top:16px;"><div class="tl-group-header"><span>미분류 이벤트</span><span>'+unassigned.length+'건</span></div>';
+      html+='<div style="margin-top:16px;"><div class="tl-group-header"><span>Unassigned Events</span><span>'+unassigned.length+'</span></div>';
       html+=unassigned.map(e=>renderEventRow(e,now)).join('');
       html+='</div>';
     }
     if(!preFiltered.length){
-      html='<div style="text-align:center;padding:48px;color:var(--muted);font-size:13px;">조건에 맞는 이벤트가 없습니다.</div>';
+      html='<div style="text-align:center;padding:48px;color:var(--muted);font-size:13px;">No events match the filters.</div>';
     }
     document.getElementById('hist-list').innerHTML=html;
     return;
   }
 
-  // ── 특정 에이전트/세션 모드: 요약 헤더 + 시간 그룹 리스트 ──
-  const isRtSession=fa.startsWith('rt:');
-  renderAgentSummaryHeader(isRtSession?'claude-code-hook':fa,events);
-  const filtered=filterEventsByAgent(preFiltered,fa);
-  document.getElementById('hist-count').textContent='총 '+filtered.length+'건';
+  // ── Single agent mode: summary header and grouped timeline ────────────────
+  renderAgentSummaryHeader(fa,events);
+  const filtered=preFiltered.filter(e=>agentIdFor(e)===fa);
+  document.getElementById('hist-count').textContent='Total '+filtered.length;
 
   if(!filtered.length){
-    document.getElementById('hist-list').innerHTML='<div style="text-align:center;padding:48px;color:var(--muted);font-size:13px;">이 에이전트의 이벤트가 없습니다.</div>';
+    document.getElementById('hist-list').innerHTML='<div style="text-align:center;padding:48px;color:var(--muted);font-size:13px;">No events for this agent.</div>';
     return;
   }
 
@@ -1717,64 +1648,64 @@ function renderHistory(model){
     const gBlocks=g.events.filter(e=>e.decision==='block').length;
     const gWarns=g.events.filter(e=>e.decision==='warn').length;
     html+='<div class="tl-group-header"><span>'+fmt(new Date(g.end).toISOString())+' ~ '+fmt(new Date(g.start).toISOString())+'</span>'+
-      '<span>'+g.events.length+'건</span>'+
-      (gBlocks?'<span class="tl-group-blocks">'+gBlocks+' 차단</span>':'')+
-      (gWarns?'<span class="tl-group-warns">'+gWarns+' 경고</span>':'')+
+      '<span>'+g.events.length+'</span>'+
+      (gBlocks?'<span class="tl-group-blocks">'+gBlocks+' Blocked</span>':'')+
+      (gWarns?'<span class="tl-group-warns">'+gWarns+' Warning</span>':'')+
     '</div>';
     for(const e of g.events){ html+=renderEventRow(e,now); }
   }
   document.getElementById('hist-list').innerHTML=html;
 }
 
-// ── 이미지 포렌식 탭 ──────────────────────────────────────────────────────────
+// ── Image forensics tab ──────────────────────────────────────────────────────
 function renderForensics(model){
   const disc=model.hiddenPromptDiscoveries||[];
   const imgs=model.imageFindings||[];
   let html='';
-  html+='<div class="panel"><div class="panel-hd"><h2>프롬프트 인젝션 탐지</h2><span class="pill inject">'+disc.length+'건 발견</span></div><div class="panel-bd">';
+  html+='<div class="panel"><div class="panel-hd"><h2>Prompt Injection Detection</h2><span class="pill inject">'+disc.length+' found</span></div><div class="panel-bd">';
   html+=disc.length
-    ?disc.map(d=>'<div class="disc-card" style="margin-bottom:10px;"><div class="disc-top"><span class="disc-title">인젝션 발견</span><span class="pill inject sm">숨겨진 프롬프트</span></div><div class="disc-meta">'+fmtFull(d.timestamp)+(d.imagePath?' · '+h(d.imagePath):'')+'</div><div class="disc-text"><code>'+h(d.prompt)+'</code></div></div>').join('')
-    :'<div class="empty">분석된 이미지에서 프롬프트 인젝션이 발견되지 않았습니다.<br><code style="font-size:11px;">scan-image --file &lt;이미지&gt;</code> 명령으로 분석하세요.</div>';
+    ?disc.map(d=>'<div class="disc-card" style="margin-bottom:10px;"><div class="disc-top"><span class="disc-title">Injection found</span><span class="pill inject sm">Hidden Prompts</span></div><div class="disc-meta">'+fmtFull(d.timestamp)+(d.imagePath?' · '+h(d.imagePath):'')+'</div><div class="disc-text"><code>'+h(d.prompt)+'</code></div></div>').join('')
+    :'<div class="empty">No prompt injections were found in analyzed images.<br><code style="font-size:11px;">scan-image --file &lt;image&gt;</code> to analyze an image.</div>';
   html+='</div></div>';
   if(imgs.length){
     html+=imgs.map(item=>{
       const iSrc=item.imageUrl||(item.imagePath?'/api/image?path='+encodeURIComponent(item.imagePath):'');
       const rBoxes=(item.regions||[]).filter(r=>r.threat).map(r=>'<div class="bbox" style="left:'+((r.x||0)*100)+'%;top:'+((r.y||0)*100)+'%;width:'+((r.width||.1)*100)+'%;height:'+((r.height||.05)*100)+'%;"><span class="bbox-lbl">'+h(r.label||'hidden')+'</span></div>').join('');
       const oBoxes=(item.objects||[]).map(o=>'<div class="bbox obj" style="left:'+((o.x||0)*100)+'%;top:'+((o.y||0)*100)+'%;width:'+((o.width||.1)*100)+'%;height:'+((o.height||.1)*100)+'%;"><span class="bbox-lbl">'+h(o.label||'object')+'</span></div>').join('');
-      const injHtml=item.hiddenPrompts?.length?'<div class="inj-banner"><div class="inj-banner-ttl">숨겨진 프롬프트 ('+item.hiddenPrompts.length+'건 발견)</div>'+item.hiddenPrompts.map(p=>'<div class="inj-item"><code>'+h(p)+'</code></div>').join('')+'</div>':'';
+      const injHtml=item.hiddenPrompts?.length?'<div class="inj-banner"><div class="inj-banner-ttl">Hidden Prompts ('+item.hiddenPrompts.length+' found)</div>'+item.hiddenPrompts.map(p=>'<div class="inj-item"><code>'+h(p)+'</code></div>').join('')+'</div>':'';
       const fHtml=item.findings.map(f=>'<div class="finding-row">'+sevPill(f.severity)+'<strong>'+h(f.id)+'</strong><span style="color:var(--muted);">'+h(f.rationale||'')+'</span></div>').join('');
-      return '<div class="img-card"><div class="img-card-hd"><div style="display:flex;align-items:center;gap:8px;">'+bdg('image')+'<strong>'+h(item.imageId||item.eventId||'이미지 이벤트')+'</strong></div><div style="display:flex;align-items:center;gap:8px;"><span class="pill '+item.decision+'">'+ST_LABEL[item.decision]+'</span><span style="font-size:11px;color:var(--muted);">'+fmtFull(item.timestamp)+'</span></div></div><div class="img-card-bd">'+(iSrc?'<div class="img-frame"><img src="'+h(iSrc)+'" alt="증거 이미지" onerror="this.style.display=\\'none\\';this.nextElementSibling.style.display=\\'block\\'"><div class="img-missing">이미지 파일 없음 — 추출 텍스트로 표시</div>'+rBoxes+oBoxes+'</div>':'<div class="img-frame"><div class="img-missing" style="display:block;">이미지 경로 없음</div></div>')+'<div class="img-info">'+injHtml+(item.extractedText?'<div><span class="lbl-sm">추출 텍스트</span><div class="ocr"><code>'+h(item.extractedText)+'</code></div></div>':'')+(fHtml?'<div><span class="lbl-sm">탐지 결과</span><div class="finding-list">'+fHtml+'</div></div>':'')+'<div style="font-size:11px;color:var(--muted);">해시: <code>'+h((item.imageHash||'').slice(0,16))+'</code> · 신뢰도: '+h(item.confidence??'n/a')+'</div></div></div></div>';
+      return '<div class="img-card"><div class="img-card-hd"><div style="display:flex;align-items:center;gap:8px;">'+bdg('image')+'<strong>'+h(item.imageId||item.eventId||'Image Event')+'</strong></div><div style="display:flex;align-items:center;gap:8px;"><span class="pill '+item.decision+'">'+ST_LABEL[item.decision]+'</span><span style="font-size:11px;color:var(--muted);">'+fmtFull(item.timestamp)+'</span></div></div><div class="img-card-bd">'+(iSrc?'<div class="img-frame"><img src="'+h(iSrc)+'" alt="Evidence image" onerror="this.style.display=\\'none\\';this.nextElementSibling.style.display=\\'block\\'"><div class="img-missing">Image file unavailable — showing extracted text</div>'+rBoxes+oBoxes+'</div>':'<div class="img-frame"><div class="img-missing" style="display:block;">No image path</div></div>')+'<div class="img-info">'+injHtml+(item.extractedText?'<div><span class="lbl-sm">Extracted Text</span><div class="ocr"><code>'+h(item.extractedText)+'</code></div></div>':'')+(fHtml?'<div><span class="lbl-sm">Findings</span><div class="finding-list">'+fHtml+'</div></div>':'')+'<div style="font-size:11px;color:var(--muted);">Hash: <code>'+h((item.imageHash||'').slice(0,16))+'</code> · Confidence: '+h(item.confidence??'n/a')+'</div></div></div></div>';
     }).join('');
   } else {
-    html+='<div class="panel"><div class="panel-bd" style="padding:16px;"><div class="empty">이미지 분석 결과가 없습니다. <code>scan-image --file &lt;경로&gt;</code> 명령으로 이미지를 분석하세요.</div></div></div>';
+    html+='<div class="panel"><div class="panel-bd" style="padding:16px;"><div class="empty">No image analysis results. Run <code>scan-image --file &lt;path&gt;</code> to analyze an image.</div></div></div>';
   }
   document.getElementById('foren-content').innerHTML=html;
 }
 
-// ── 룰 엔진 탭 ───────────────────────────────────────────────────────────────
+// ── Rule engine tab ──────────────────────────────────────────────────────────
 function renderRules(model){
   const rb=model.runbook||[];
   const cands=model.candidates||[];
   const sc=model.surfaceCounts||{};
   let html='';
-  html+='<div class="panel"><div class="panel-hd"><h2>3-에이전트 런북</h2></div><div class="panel-bd"><div class="rb-grid">'+
-    rb.map(r=>'<div class="rb-card"><div class="rb-icon">'+h(r.icon)+'</div><div class="rb-title">'+h(r.label)+'</div><div class="rb-obj">'+h(r.objective)+'</div><div class="rb-lbl">입력</div><div style="font-size:12px;color:var(--muted);">'+h(r.inputs)+'</div><div class="rb-lbl">출력</div><div style="font-size:12px;color:var(--muted);">'+h(r.outputs)+'</div><div class="rb-lbl">명령어</div><code class="rb-cmd">'+h(r.command)+'</code></div>').join('')+
+  html+='<div class="panel"><div class="panel-hd"><h2>3-Agent Runbook</h2></div><div class="panel-bd"><div class="rb-grid">'+
+    rb.map(r=>'<div class="rb-card"><div class="rb-icon">'+h(r.icon)+'</div><div class="rb-title">'+h(r.label)+'</div><div class="rb-obj">'+h(r.objective)+'</div><div class="rb-lbl">Inputs</div><div style="font-size:12px;color:var(--muted);">'+h(r.inputs)+'</div><div class="rb-lbl">Outputs</div><div style="font-size:12px;color:var(--muted);">'+h(r.outputs)+'</div><div class="rb-lbl">Command</div><code class="rb-cmd">'+h(r.command)+'</code></div>').join('')+
   '</div></div></div>';
   const scItems=Object.entries(sc).sort((a,b)=>b[1]-a[1]);
   if(scItems.length){
-    html+='<div class="panel"><div class="panel-hd"><h2>서피스별 스캔 통계</h2></div><div class="panel-bd"><div class="surf-grid">'+
-      scItems.map(([s,n])=>'<div class="surf-card">'+bdg(s)+'<strong>'+n+'</strong><span>건 스캔</span></div>').join('')+
+    html+='<div class="panel"><div class="panel-hd"><h2>Scanned Count by Surface</h2></div><div class="panel-bd"><div class="surf-grid">'+
+      scItems.map(([s,n])=>'<div class="surf-card">'+bdg(s)+'<strong>'+n+'</strong><span> scanned</span></div>').join('')+
     '</div></div></div>';
   }
-  html+='<div class="panel"><div class="panel-hd"><h2>자동 생성 룰 후보</h2><span style="font-size:12px;color:var(--muted);">'+cands.length+'건 검토 대기</span></div><div class="panel-bd">';
+  html+='<div class="panel"><div class="panel-hd"><h2>Auto-Generated Rule Candidates</h2><span style="font-size:12px;color:var(--muted);">'+cands.length+' pending review</span></div><div class="panel-bd">';
   html+=cands.length
-    ?'<div class="cand-list">'+cands.map(c=>'<div class="cand-card"><div class="cand-id">'+h(c.rule?.id??c.id)+'</div><div class="cand-reason">'+h(c.reason??'정책 후보')+'</div><code class="cand-pat">'+h(c.rule?.pattern??'')+'</code></div>').join('')+'</div>'
-    :'<div class="empty">룰 후보가 없습니다. <code>npm run self-loop</code> 로 최근 차단 이벤트에서 후보를 생성하세요.</div>';
+    ?'<div class="cand-list">'+cands.map(c=>'<div class="cand-card"><div class="cand-id">'+h(c.rule?.id??c.id)+'</div><div class="cand-reason">'+h(c.reason??'Policy candidate')+'</div><code class="cand-pat">'+h(c.rule?.pattern??'')+'</code></div>').join('')+'</div>'
+    :'<div class="empty">No rule candidates. Run <code>npm run self-loop</code> to generate candidates from recent blocked events.</div>';
   html+='</div></div>';
   document.getElementById('rule-content').innerHTML=html;
 }
 
-// ── 토스트 알림 ─────────────────────────────────────────────────────────────
+// ── Toast alerts ─────────────────────────────────────────────────────────────
 function showToast(event){
   const container=document.getElementById('toast-container');
   const d=event.decision;
@@ -1787,7 +1718,7 @@ function showToast(event){
   toast.className='toast '+d;
   toast.innerHTML='<span class="toast-icon">'+(d==='block'?'🚫':'⚠️')+'</span>'+
     '<div class="toast-body">'+
-      '<div class="toast-title '+d+'">'+(d==='block'?'차단됨':'경고')+': '+h(ruleId)+'</div>'+
+      '<div class="toast-title '+d+'">'+(d==='block'?'Blocked':'Warning')+': '+h(ruleId)+'</div>'+
       '<div class="toast-detail">'+h(rationale.slice(0,80))+(aLbl?' · '+h(aLbl):'')+'</div>'+
       (severity?'<span class="toast-severity '+h(severity)+'">'+h(severity)+'</span>':'')+
     '</div>';
@@ -1805,7 +1736,7 @@ function checkNewBlocks(model){
   }
 }
 
-// ── 액션 배너 ───────────────────────────────────────────────────────────────
+// ── Action banner ────────────────────────────────────────────────────────────
 function renderActionBanner(model){
   const el=document.getElementById('action-banner');
   const ss=model.safetyScore||{score:100,level:'safe'};
@@ -1815,21 +1746,21 @@ function renderActionBanner(model){
     el.style.display='flex';
     el.className='action-banner critical';
     el.innerHTML='<span class="action-banner-icon">🚨</span>'+
-      '<div class="action-banner-text"><strong>'+recentBlocks.length+'건의 차단 이벤트</strong>가 최근 5분 내 발생했습니다.'+
-      (agents.length?' 감지 에이전트: '+agents.map(a=>h(AGENT_LABEL[a]||a)).join(', '):'')+
-      '</div><div class="action-banner-actions"><button class="action-banner-btn primary" data-tab="history">히스토리 보기</button></div>';
+      '<div class="action-banner-text"><strong>'+recentBlocks.length+' blocked events</strong> occurred in the last 5 minutes.'+
+      (agents.length?' Detected Agent: '+agents.map(a=>h(AGENT_LABEL[a]||a)).join(', '):'')+
+      '</div><div class="action-banner-actions"><button class="action-banner-btn primary" data-tab="history">View History</button></div>';
   } else if(ss.level==='caution'){
     el.style.display='flex';el.className='action-banner warning';
-    el.innerHTML='<span class="action-banner-icon">⚠️</span><div class="action-banner-text">보안 점수 <strong>'+ss.score+'점</strong> — 경고 이벤트를 확인하세요.</div>';
+    el.innerHTML='<span class="action-banner-icon">⚠️</span><div class="action-banner-text">Security score <strong>'+ss.score+'pts</strong> — review warning events.</div>';
   } else if(ss.score<100){
     el.style.display='flex';el.className='action-banner safe';
-    el.innerHTML='<span class="action-banner-icon">✅</span><div class="action-banner-text">현재 안전 상태입니다. 보안 점수 '+ss.score+'점.</div>';
+    el.innerHTML='<span class="action-banner-icon">✅</span><div class="action-banner-text">System is currently safe. Security score '+ss.score+'pts.</div>';
   } else {
     el.style.display='none';
   }
 }
 
-// ── 에이전트 상세 확장 패널 ─────────────────────────────────────────────────
+// ── Agent detail expansion panel ─────────────────────────────────────────────
 function toggleAgentDetail(agentId){
   const existing=document.querySelector('.agent-detail-panel[data-for="'+agentId+'"]');
   if(existing){existing.remove();return;}
@@ -1846,16 +1777,16 @@ function toggleAgentDetail(agentId){
     ?stats.topRules.map(([r,n])=>{
       const maxN=stats.topRules[0][1];
       const pct=maxN?(n/maxN*100):0;
-      return '<div class="rule-bar"><div class="rule-bar-fill" style="width:'+pct+'%;"></div><code>'+h(r)+'</code><span>'+n+'건</span></div>';
+      return '<div class="rule-bar"><div class="rule-bar-fill" style="width:'+pct+'%;"></div><code>'+h(r)+'</code><span>'+n+'</span></div>';
     }).join('')
-    :'<div style="font-size:11px;color:var(--muted);">차단된 룰이 없습니다.</div>';
+    :'<div style="font-size:11px;color:var(--muted);">No blocked rules.</div>';
 
   const surfTotal=Object.values(stats.surfaces).reduce((a,b)=>a+b,0)||1;
   const surfBarHtml='<div class="surf-bar-wrap">'+
     Object.entries(stats.surfaces).map(([s,n])=>{
       const pct=((n/surfTotal)*100).toFixed(1);
       const c=SURF_COLORS[s]||'#94a3b8';
-      return '<div class="surf-bar-seg" style="width:'+pct+'%;background:'+c+';" title="'+h(s)+': '+n+'건">'+h(s.slice(0,3))+'</div>';
+      return '<div class="surf-bar-seg" style="width:'+pct+'%;background:'+c+';" title="'+h(s)+': '+n+'">'+h(s.slice(0,3))+'</div>';
     }).join('')+'</div>';
 
   const recentHtml=events.slice(0,8).map(e=>{
@@ -1866,19 +1797,19 @@ function toggleAgentDetail(agentId){
   const panel=document.createElement('div');
   panel.className='agent-detail-panel';
   panel.dataset.for=agentId;
-  panel.innerHTML='<div class="adp-header"><h3>'+m.icon+' '+h(m.label)+' — 상세 분석</h3><button class="adp-close">✕</button></div>'+
+  panel.innerHTML='<div class="adp-header"><h3>'+m.icon+' '+h(m.label)+' — Detailed Analysis</h3><button class="adp-close">✕</button></div>'+
     '<div class="adp-stats-row">'+
-      '<div class="adp-stat"><div class="adp-stat-val" style="color:var(--block);">'+stats.block+'</div><div class="adp-stat-lbl">차단</div></div>'+
-      '<div class="adp-stat"><div class="adp-stat-val" style="color:var(--warn);">'+stats.warn+'</div><div class="adp-stat-lbl">경고</div></div>'+
-      '<div class="adp-stat"><div class="adp-stat-val" style="color:var(--allow);">'+stats.allow+'</div><div class="adp-stat-lbl">허용</div></div>'+
-      '<div class="adp-stat"><div class="adp-stat-val">'+rate+'%</div><div class="adp-stat-lbl">차단율</div></div>'+
-      '<div class="adp-stat"><div class="adp-stat-val">'+stats.total+'</div><div class="adp-stat-lbl">총 이벤트</div></div>'+
+      '<div class="adp-stat"><div class="adp-stat-val" style="color:var(--block);">'+stats.block+'</div><div class="adp-stat-lbl">Blocked</div></div>'+
+      '<div class="adp-stat"><div class="adp-stat-val" style="color:var(--warn);">'+stats.warn+'</div><div class="adp-stat-lbl">Warning</div></div>'+
+      '<div class="adp-stat"><div class="adp-stat-val" style="color:var(--allow);">'+stats.allow+'</div><div class="adp-stat-lbl">Allowed</div></div>'+
+      '<div class="adp-stat"><div class="adp-stat-val">'+rate+'%</div><div class="adp-stat-lbl">Block rate</div></div>'+
+      '<div class="adp-stat"><div class="adp-stat-val">'+stats.total+'</div><div class="adp-stat-lbl">Total events</div></div>'+
     '</div>'+
     '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">'+
-      '<div class="adp-section"><h4>상위 트리거 룰</h4>'+ruleBarsHtml+'</div>'+
-      '<div class="adp-section"><h4>서피스 분포</h4>'+surfBarHtml+'</div>'+
+      '<div class="adp-section"><h4>Top Trigger Rules</h4>'+ruleBarsHtml+'</div>'+
+      '<div class="adp-section"><h4>Surface Distribution</h4>'+surfBarHtml+'</div>'+
     '</div>'+
-    '<div class="adp-section"><h4>최근 이벤트</h4><div class="adp-events">'+recentHtml+'</div></div>';
+    '<div class="adp-section"><h4>Recent Events</h4><div class="adp-events">'+recentHtml+'</div></div>';
 
   const grid=document.getElementById('agent-flows');
   const col=grid.querySelector('[data-agent-id="'+agentId+'"]');
@@ -1886,7 +1817,7 @@ function toggleAgentDetail(agentId){
   else grid.appendChild(panel);
 }
 
-// ── 전체 렌더 ─────────────────────────────────────────────────────────────────
+// ── Render all ───────────────────────────────────────────────────────────────
 function renderAll(model){
   lastModel=model;
   checkNewBlocks(model);
@@ -1909,7 +1840,7 @@ function renderAll(model){
   document.getElementById('updated').textContent=new Date(model.generatedAt).toLocaleTimeString('ko-KR',{hour12:false});
 }
 
-// ── SSE 연결 ──────────────────────────────────────────────────────────────────
+// ── SSE connection ───────────────────────────────────────────────────────────
 const sse=new EventSource('/api/events');
 sse.onmessage=e=>{
   try{
@@ -1926,7 +1857,7 @@ sse.onmessage=e=>{
 sse.onopen=()=>{ document.getElementById('live-dot').className='dot live'; };
 sse.onerror=()=>{
   document.getElementById('live-dot').className='dot err';
-  document.getElementById('updated').textContent='재연결 중...';
+  document.getElementById('updated').textContent='Reconnecting...';
 };
 
 // ── Image Upload ──────────────────────────────────────────────────────────────
@@ -2014,5 +1945,5 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const port = Number(process.env.PORT ?? DEFAULT_PORT);
   const dataDir = process.env.FOUR04GENT_DATA_DIR ?? '.404gent';
   const { port: actualPort } = await startDashboardServer({ port, dataDir });
-  console.log(`404gent 대시보드: http://127.0.0.1:${actualPort}`);
+  console.log(`404gent dashboard: http://127.0.0.1:${actualPort}`);
 }
