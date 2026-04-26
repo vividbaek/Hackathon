@@ -13,7 +13,7 @@ export async function getOriginal(input) {
 /**
  * Splits image into grid after normalizing to a standard width (Industry Standard)
  */
-export async function gridScaleUp(input, rows = 2, cols = 2, factor = 2, targetWidth = 2000) {
+export async function gridScaleUp(input, rows = 2, cols = 2, factor = 2, targetWidth = 2000, options = {}) {
   // 1. Ensure image is at target width
   let image = sharp(input);
   let metadata = await image.metadata();
@@ -39,11 +39,15 @@ export async function gridScaleUp(input, rows = 2, cols = 2, factor = 2, targetW
       const actualWidth = (c === cols - 1) ? width - left : cellWidth;
       const actualHeight = (r === rows - 1) ? height - top : cellHeight;
 
-      console.log(`  -> Crop [${r},${c}]: ${actualWidth}x${actualHeight} at (${left},${top})`);
+      if (!options.quiet) {
+        console.log(`  -> Crop [${r},${c}]: ${actualWidth}x${actualHeight} at (${left},${top})`);
+      }
 
       // Skip very small crops or slivers (user requested to drop too small images)
       if (actualWidth < 100 || actualHeight < 100) {
-        console.warn(`     [SKIP] Image too small for scaling`);
+        if (!options.quiet) {
+          console.warn(`     [SKIP] Image too small for scaling`);
+        }
         continue;
       }
       
@@ -60,7 +64,9 @@ export async function gridScaleUp(input, rows = 2, cols = 2, factor = 2, targetW
         
         crops.push({ row: r, col: c, buffer });
       } catch (err) {
-        console.error(`     [ERROR] Failed to extract/resize at [${r},${c}]: ${err.message}`);
+        if (!options.quiet) {
+          console.error(`     [ERROR] Failed to extract/resize at [${r},${c}]: ${err.message}`);
+        }
       }
     }
   }

@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { applyCompanyProfile, loadConfig } from './config.js';
 import { mergeReports, scanText } from './policy/engine.js';
 import { encodeImageFile, createVisionProviderFromConfig } from './providers/vision-llm.js';
+import { preprocessImage } from './image-preprocess.js';
 import { normalizePreprocessedImageResult } from './vision.js';
 import { highestSeverity } from './policy/severity.js';
 import { runGuardedCommand } from './runner.js';
@@ -32,6 +33,7 @@ Usage:
   404gent scan-image <vlm-or-ocr-text>
   404gent scan-image --file <image-path>
   404gent scan-image --preprocessed <json-path>
+  404gent preprocess-image <image-path>
   404gent scan-llm <text>
   404gent agent --role <qa|backend|security> -- <task>
   404gent pipe --role <from> --to <to> -- <output-text>
@@ -275,6 +277,25 @@ export async function main(argv = process.argv.slice(2)) {
     const { host, port } = await startPolicyServer({ configPath: options.configPath });
     console.log(`404gent policy server listening on http://${host}:${port}`);
     await new Promise(() => {});
+    return 0;
+  }
+
+  if (command === 'preprocess-image') {
+    const imagePath = options.filePath ?? text;
+    if (!imagePath) {
+      console.error('preprocess-image requires an image path.');
+      return 2;
+    }
+    const result = await preprocessImage(imagePath, config, { quiet: true });
+    if (options.json) {
+      console.log(JSON.stringify(result, null, 2));
+    } else {
+      console.log(`Preprocessed image: ${result.imageId}`);
+      console.log(`Raw: ${result.rawPath}`);
+      console.log(`Normalized: ${result.normalizedPath}`);
+      console.log(`JSON: ${result.preprocessedPath}`);
+      console.log(`Detections: ${result.detections} (${result.hiddenDetections} hidden)`);
+    }
     return 0;
   }
 
