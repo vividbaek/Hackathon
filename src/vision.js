@@ -34,7 +34,9 @@ export function normalizeVisionObservation(observation = {}) {
       extractedText,
       regions: observation.regions ?? [],
       visualSignals: observation.visualSignals ?? [],
-      confidence: observation.confidence
+      confidence: observation.confidence,
+      hiddenPrompts: observation.hiddenPrompts ?? [],
+      objects: observation.objects ?? []
     },
     artifacts: [
       {
