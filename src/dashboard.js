@@ -1,11 +1,9 @@
 #!/usr/bin/env node
 import { createServer } from 'node:http';
-import { readFile, mkdir, writeFile, readdir } from 'node:fs/promises';
+import { readFile, readdir } from 'node:fs/promises';
 import { extname, join, resolve, sep } from 'node:path';
 import { loadConfig } from './config.js';
-import { createVisionProviderFromConfig } from './providers/vision-llm.js';
-import { scanText, mergeReports } from './policy/engine.js';
-import { highestSeverity } from './policy/severity.js';
+import { scanText } from './policy/engine.js';
 import { recordReport } from './guard.js';
 import { preprocessImage } from './image-preprocess.js';
 
@@ -91,11 +89,25 @@ const AGENT_ALIASES = {
   security: 'agent-security',
   'agent-security': 'agent-security'
 };
+const BASE_AGENT_ROLES = ['runtime', 'qa', 'backend', 'security'];
+const BASE_AGENT_IDS = BASE_AGENT_ROLES.map(role => role === 'runtime' ? RUNTIME_HOOK_AGENT_ID : `agent-${role}`);
+
+function slugAgentId(value) {
+  return String(value ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
 
 function normalizeDashboardAgentId(value) {
   const raw = String(value ?? '').trim();
   if (!raw) return '';
-  return AGENT_ALIASES[raw] ?? AGENT_ALIASES[raw.toLowerCase()] ?? raw;
+  const lower = raw.toLowerCase();
+  const known = AGENT_ALIASES[raw] ?? AGENT_ALIASES[lower];
+  if (known) return known;
+  if (lower.startsWith('agent-')) return `agent-${slugAgentId(lower.slice(6))}`;
+  return `agent-${slugAgentId(lower)}`;
 }
 
 function agentFromSource(source) {
@@ -106,10 +118,26 @@ function agentFromSource(source) {
 function dashboardAgentId(e) {
   return normalizeDashboardAgentId(
     e.event?.agentId ??
+    e.agentId ??
+    e.event?.meta?.agentId ??
     e.event?.meta?.agent ??
     agentFromSource(e.event?.source) ??
     (e.event?.source === 'claude-code-hook' ? RUNTIME_HOOK_AGENT_ID : '')
   );
+}
+
+function agentRole(agentId) {
+  if (agentId === RUNTIME_HOOK_AGENT_ID) return 'runtime';
+  return String(agentId ?? '').replace(/^agent-/, '');
+}
+
+function dashboardAgentIds(events) {
+  const ids = new Set(BASE_AGENT_IDS);
+  for (const event of events) {
+    const id = dashboardAgentId(event);
+    if (id) ids.add(id);
+  }
+  return [...ids];
 }
 
 const threeAgentRunbook = [
@@ -238,9 +266,8 @@ function computeSafetyScore(events, candidates) {
 }
 
 function computeAgentStats(events) {
-  const ROLES = ['runtime', 'qa', 'backend', 'security'];
-  return ROLES.map(role => {
-    const agentId = role === 'runtime' ? RUNTIME_HOOK_AGENT_ID : `agent-${role}`;
+  return dashboardAgentIds(events).map(agentId => {
+    const role = agentRole(agentId);
     const agentEvents = events.filter(e => dashboardAgentId(e) === agentId);
     const blockEvents = agentEvents.filter(e => e.decision === 'block');
     const ruleFreq = {};
@@ -400,11 +427,10 @@ function taskFromEvent(ev) {
 }
 
 function buildAgentFlows(events) {
-  const ROLES = ['runtime', 'qa', 'backend', 'security'];
   const RECENT_MS = 5 * 60 * 1000;
   const now = Date.now();
-  return ROLES.map(role => {
-    const agentId = role === 'runtime' ? RUNTIME_HOOK_AGENT_ID : `agent-${role}`;
+  return dashboardAgentIds(events).map(agentId => {
+    const role = agentRole(agentId);
     const agentEvents = events
       .filter(e => dashboardAgentId(e) === agentId)
       .sort((a, b) => Date.parse(eventTime(b) ?? '') - Date.parse(eventTime(a) ?? ''));
@@ -572,69 +598,68 @@ function mimeType(p) {
   const x = extname(p).toLowerCase();
   return { '.png':'image/png', '.jpg':'image/jpeg', '.jpeg':'image/jpeg', '.gif':'image/gif', '.webp':'image/webp', '.svg':'image/svg+xml' }[x] ?? 'application/octet-stream';
 }
-function resolveEvidencePath(p) {
+async function resolveEvidencePath(p, dataDir = '.404gent') {
   const root = resolve(process.cwd());
-  const abs = resolve(root, p);
-  if (abs !== root && !abs.startsWith(root + sep)) throw new Error('Image path outside workspace.');
-  return abs;
+  const dataRoot = resolve(root, dataDir);
+  const candidates = [];
+  if (p.startsWith(sep)) candidates.push(resolve(p));
+  else {
+    candidates.push(resolve(root, p));
+    candidates.push(resolve(dataRoot, p));
+  }
+  for (const abs of candidates) {
+    const inWorkspace = abs === root || abs.startsWith(root + sep);
+    const inDataDir = abs === dataRoot || abs.startsWith(dataRoot + sep);
+    if (!inWorkspace && !inDataDir) continue;
+    try {
+      await readFile(abs);
+      return abs;
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw e;
+    }
+  }
+  throw new Error('Image not found.');
 }
-async function sendEvidenceImage(res, p) {
+async function sendEvidenceImage(res, p, dataDir = '.404gent') {
   if (!p) { res.writeHead(400); res.end('Missing path'); return; }
-  const body = await readFile(resolveEvidencePath(p));
+  const body = await readFile(await resolveEvidencePath(p, dataDir));
   res.writeHead(200, { 'content-type':mimeType(p), 'cache-control':'no-store' });
   res.end(body);
 }
 
-const MAX_UPLOAD_SIZE = 10 * 1024 * 1024;
-const ALLOWED_IMAGE_TYPES = { '.png':'image/png', '.jpg':'image/jpeg', '.jpeg':'image/jpeg', '.gif':'image/gif', '.webp':'image/webp' };
+const IMAGE_FILE_RE = /\.(png|jpe?g|gif|webp|svg)$/i;
 
-async function readRawBody(req, maxSize = MAX_UPLOAD_SIZE) {
+async function readRawBody(req, maxSize = 1024 * 64) {
   const chunks = [];
   let size = 0;
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > maxSize) throw new Error(`파일이 너무 큽니다. 최대 ${maxSize / 1024 / 1024}MB까지 가능합니다.`);
+    if (size > maxSize) throw new Error('Request body too large.');
     chunks.push(chunk);
   }
   return Buffer.concat(chunks);
 }
 
-function parseMultipartFormData(contentType, body) {
-  const match = contentType.match(/boundary=(?:"([^"]+)"|([^\s;]+))/);
-  if (!match) throw new Error('Missing multipart boundary.');
-  const boundary = match[1] || match[2];
-  const boundaryBuf = Buffer.from(`--${boundary}`);
-  const parts = [];
-  let start = body.indexOf(boundaryBuf);
-  if (start === -1) throw new Error('No multipart boundary found in body.');
-  while (true) {
-    start += boundaryBuf.length;
-    if (body[start] === 0x2D && body[start + 1] === 0x2D) break;
-    start += 2;
-    const headerEnd = body.indexOf(Buffer.from('\r\n\r\n'), start);
-    if (headerEnd === -1) break;
-    const headerStr = body.subarray(start, headerEnd).toString('utf8');
-    const dataStart = headerEnd + 4;
-    const nextBoundary = body.indexOf(boundaryBuf, dataStart);
-    if (nextBoundary === -1) break;
-    const data = body.subarray(dataStart, nextBoundary - 2);
-    const headers = {};
-    for (const line of headerStr.split('\r\n')) {
-      const ci = line.indexOf(':');
-      if (ci > 0) headers[line.slice(0, ci).toLowerCase().trim()] = line.slice(ci + 1).trim();
-    }
-    const disposition = headers['content-disposition'] || '';
-    const nameMatch = disposition.match(/name="([^"]+)"/);
-    const filenameMatch = disposition.match(/filename="([^"]+)"/);
-    parts.push({ name: nameMatch?.[1] ?? '', filename: filenameMatch?.[1] ?? null, contentType: headers['content-type'] ?? 'application/octet-stream', data });
-    start = nextBoundary;
-  }
-  return parts;
-}
-
 function sendJsonError(res, status, msg) {
   res.writeHead(status, { 'content-type':'application/json; charset=utf-8' });
   res.end(JSON.stringify({ error: msg }));
+}
+
+async function readImageFilenames(dir) {
+  let files = [];
+  try { files = await readdir(dir); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  return files.filter(f => IMAGE_FILE_RE.test(f)).sort().reverse();
+}
+
+function imageIdFromPath(path = '') {
+  return path.split(/[\\/]/).pop()?.replace(/\.[^.]+$/, '') ?? '';
+}
+
+function addGalleryImage(map, image) {
+  if (!image.rawPath) return;
+  const key = image.rawPath;
+  const prev = map.get(key) ?? {};
+  map.set(key, { ...prev, ...image, imageId: image.imageId ?? prev.imageId ?? imageIdFromPath(image.rawPath) });
 }
 
 export function createDashboardServer({ dataDir = '.404gent' } = {}) {
@@ -656,23 +681,58 @@ export function createDashboardServer({ dataDir = '.404gent' } = {}) {
         return;
       }
       if (url.pathname === '/api/status') { sendJson(res, await readDashboardModel({ dataDir })); return; }
-      if (url.pathname === '/api/image') { await sendEvidenceImage(res, url.searchParams.get('path')); return; }
+      if (url.pathname === '/api/image') { await sendEvidenceImage(res, url.searchParams.get('path'), dataDir); return; }
 
       // ── Image Gallery: list all images with scan results ──────────────────
       if (url.pathname === '/api/images') {
+        const imageMap = new Map();
         const rawDir = join(dataDir, 'images', 'raw');
-        let files = [];
-        try { files = await readdir(rawDir); } catch (e) { if (e.code !== 'ENOENT') throw e; }
-        files = files.filter(f => /\.(png|jpe?g|gif|webp)$/i.test(f)).sort().reverse();
+        const rootImageDir = join(dataDir, 'images');
+        const rawFiles = await readImageFilenames(rawDir);
+        const rootFiles = await readImageFilenames(rootImageDir);
+        for (const f of rawFiles) {
+          const imageId = imageIdFromPath(f);
+          addGalleryImage(imageMap, {
+            imageId,
+            rawPath: `images/raw/${f}`,
+            normalizedPath: `images/normalized/${imageId}.normalized.png`
+          });
+        }
+        for (const f of rootFiles) {
+          addGalleryImage(imageMap, {
+            imageId: imageIdFromPath(f),
+            rawPath: `images/${f}`,
+            normalizedPath: null
+          });
+        }
+        const model = await readDashboardModel({ dataDir });
+        for (const event of model.events ?? []) {
+          const evidence = event.event?.evidence ?? {};
+          const rawPath = evidence.imagePath ?? evidence.sourceImagePath;
+          if (!rawPath) continue;
+          const normalizedPath = evidence.normalizedImagePath ?? null;
+          addGalleryImage(imageMap, {
+            imageId: evidence.imageId ?? imageIdFromPath(rawPath),
+            rawPath,
+            normalizedPath,
+            eventScanResult: {
+              decision: event.decision ?? 'allow',
+              findings: event.findings ?? [],
+              hiddenCount: evidence.hiddenPrompts?.length ?? 0,
+              ocrCount: evidence.regions?.length ?? 0,
+              timestamp: eventTime(event)
+            }
+          });
+        }
         const config = await getConfig();
-        const images = await Promise.all(files.map(async (f) => {
-          const imageId = f.replace(/\.[^.]+$/, '');
-          const rawPath = `images/raw/${f}`;
-          const normalizedPath = `images/normalized/${imageId}.normalized.png`;
+        const images = await Promise.all([...imageMap.values()].map(async (image) => {
+          const imageId = image.imageId;
+          const rawPath = image.rawPath;
+          const normalizedPath = image.normalizedPath ?? `images/normalized/${imageId}.normalized.png`;
           const preprocessedPath = join(dataDir, 'preprocessed', `${imageId}.json`);
           let preprocessed = null;
           try { preprocessed = JSON.parse(await readFile(preprocessedPath, 'utf8')); } catch {}
-          let scanResult = null;
+          let scanResult = image.eventScanResult ?? null;
           if (preprocessed) {
             const detections = preprocessed.detections ?? [];
             const hiddenTexts = detections.filter(d => d.kind === 'hidden_text').map(d => d.text);
@@ -685,6 +745,7 @@ export function createDashboardServer({ dataDir = '.404gent' } = {}) {
           }
           return { imageId, rawPath, normalizedPath, preprocessed: !!preprocessed, scanResult };
         }));
+        images.sort((a, b) => String(b.scanResult?.timestamp ?? b.imageId).localeCompare(String(a.scanResult?.timestamp ?? a.imageId)));
         sendJson(res, { images });
         return;
       }
@@ -709,80 +770,6 @@ export function createDashboardServer({ dataDir = '.404gent' } = {}) {
         const result = scanText({ surface: 'image', text: scanInput, config, evidence: { hiddenPrompts: hiddenTexts.length ? [hiddenTexts.join(' ')] : [] } });
         await recordReport(result, config);
         sendJson(res, { ok: true, imageId, scanResult: { decision: result.decision, findings: result.findings ?? [], hiddenCount: hiddenTexts.length, ocrCount: detections.filter(d => d.kind === 'ocr_text').length } });
-        return;
-      }
-
-      // ── Image Upload Scan ─────────────────────────────────────────────────
-      if (req.method === 'POST' && url.pathname === '/api/scan-image') {
-        const ct = req.headers['content-type'] || '';
-        if (!ct.includes('multipart/form-data')) { sendJsonError(res, 400, 'Expected multipart/form-data'); return; }
-        const rawBody = await readRawBody(req);
-        const parts = parseMultipartFormData(ct, rawBody);
-        const filePart = parts.find(p => p.name === 'image' && p.filename);
-        if (!filePart) { sendJsonError(res, 400, 'No image file found. Use field name "image".'); return; }
-        const ext = (filePart.filename.match(/\.[^.]+$/) || ['.bin'])[0].toLowerCase();
-        const mediaType = ALLOWED_IMAGE_TYPES[ext];
-        if (!mediaType) { sendJsonError(res, 400, `지원하지 않는 이미지: ${ext}. PNG, JPG, GIF, WebP만 가능합니다.`); return; }
-
-        const uploadDir = join(dataDir, 'uploads');
-        await mkdir(uploadDir, { recursive: true });
-        const safeFilename = filePart.filename.replace(/[^a-zA-Z0-9._-]/g, '_');
-        const savedPath = join(uploadDir, `${Date.now()}-${safeFilename}`);
-        await writeFile(savedPath, filePart.data);
-
-        const config = await getConfig();
-
-        // 1) OCR 멀티패스 (Tesseract: 극한대비, CLAHE, 엣지, 임계값) → 숨겨진 텍스트 추출
-        let ocrHiddenTexts = [];
-        let ocrAllTexts = [];
-        let preprocessResult = null;
-        try {
-          preprocessResult = await preprocessImage(savedPath, config, { quiet: true });
-          const detections = preprocessResult.preprocessed?.detections ?? [];
-          ocrHiddenTexts = detections.filter(d => d.kind === 'hidden_text').map(d => d.text);
-          ocrAllTexts = detections.map(d => d.text);
-        } catch (ocrErr) {
-          console.error('OCR preprocessing failed (continuing with Vision API):', ocrErr.message);
-        }
-
-        // 2) Vision API (Claude) → 이미지 직접 분석
-        const visionProvider = createVisionProviderFromConfig(config);
-        const base64 = filePart.data.toString('base64');
-        const visionResult = await visionProvider.analyzeImage({ base64, mediaType });
-
-        // 3) 모든 소스에서 추출된 텍스트 결합 (공백+줄바꿈 양쪽으로 결합하여 패턴 매칭 향상)
-        const ocrHiddenSentence = ocrHiddenTexts.join(' ');
-        const ocrAllSentence = ocrAllTexts.join(' ');
-        const scanInput = [
-          ...visionResult.hiddenPrompts,
-          ...(visionResult.regions ?? []).map(r => r.text).filter(Boolean),
-          ocrHiddenSentence,
-          ocrAllSentence
-        ].filter(Boolean).join('\n') || '';
-
-        const allHiddenPrompts = [
-          ...visionResult.hiddenPrompts,
-          ...(ocrHiddenSentence ? [ocrHiddenSentence] : [])
-        ].filter(Boolean);
-
-        // 4) 룰엔진 스캔
-        let result = scanText({ surface: 'image', text: scanInput, config, evidence: {
-          hiddenPrompts: allHiddenPrompts, objects: visionResult.objects,
-          regions: visionResult.regions, imagePath: savedPath,
-          ocrDetections: preprocessResult?.preprocessed?.detections,
-          normalizedImagePath: preprocessResult?.normalizedPath
-        }});
-
-        // 5) Vision 결과 병합
-        if (!visionResult.skipped) {
-          const merged = mergeReports(result, visionResult, config);
-          result = { ...merged, surface: 'image', text: scanInput,
-            severity: merged.findings.length > 0 ? highestSeverity(merged.findings) : 'low',
-            scannedAt: result.scannedAt };
-        }
-
-        await recordReport(result, config);
-        sendJson(res, result);
         return;
       }
 
@@ -1455,24 +1442,6 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
         </div>
       </div>
     </div>
-    <div class="panel" id="upload-panel">
-      <div class="panel-hd"><h2>이미지 업로드 스캔</h2><span style="font-size:11px;color:var(--muted);">PNG, JPG, GIF, WebP (최대 10MB)</span></div>
-      <div class="panel-bd" style="padding:16px;">
-        <div id="drop-zone">
-          <div style="font-size:36px;margin-bottom:8px;">📂</div>
-          <div style="font-size:13px;font-weight:600;color:var(--ink);">이미지를 드래그하거나 클릭하여 업로드</div>
-          <div style="font-size:11px;color:var(--muted);margin-top:4px;">Vision AI + 룰 엔진으로 보안 위협을 자동 탐지합니다</div>
-          <input type="file" id="file-input" accept="image/png,image/jpeg,image/gif,image/webp" style="display:none;">
-        </div>
-        <div id="upload-status" style="margin-top:12px;display:none;">
-          <div id="upload-progress" style="display:flex;align-items:center;gap:10px;padding:10px;background:#f8fafc;border-radius:8px;">
-            <span class="upload-spinner"></span>
-            <span id="upload-msg" style="font-size:12px;color:var(--muted);">이미지 분석 중...</span>
-          </div>
-        </div>
-        <div id="upload-result" style="margin-top:12px;display:none;"></div>
-      </div>
-    </div>
     <div id="foren-content"></div>
   </div>
 </div>
@@ -1500,14 +1469,21 @@ const SEV_CLS  = { critical:'critical', high:'high', medium:'medium', low:'low' 
 const AGENT_LABEL = {'claude-code-hook':'Runtime Hook','agent-qa':'QA','agent-backend':'Backend','agent-security':'Security'};
 const SURF_COLORS = {prompt:'#2563eb',command:'#d97706',output:'#059669',llm:'#0891b2',image:'#7c3aed'};
 const AGENT_ALIASES = {runtime:'claude-code-hook',hook:'claude-code-hook','claude-code-hook':'claude-code-hook',qa:'agent-qa','agent-qa':'agent-qa',backend:'agent-backend','agent-backend':'agent-backend',security:'agent-security','agent-security':'agent-security'};
+const BASE_AGENT_IDS = ['claude-code-hook','agent-qa','agent-backend','agent-security'];
 
 function h(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function fmt(v){return v?new Date(v).toLocaleTimeString('ko-KR',{hour12:false}):'—';}
 function fmtFull(v){return v?new Date(v).toLocaleString('ko-KR',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}):'—';}
 function surf(e){return e.event?.type??e.surface??'unknown';}
-function normalizeAgentId(v){const raw=String(v??'').trim();return raw?(AGENT_ALIASES[raw]||AGENT_ALIASES[raw.toLowerCase()]||raw):'';}
+function slugAgentId(v){return String(v??'').trim().toLowerCase().replace(/[^a-z0-9_-]+/g,'-').replace(/^-+|-+$/g,'');}
+function normalizeAgentId(v){const raw=String(v??'').trim();if(!raw)return '';const lower=raw.toLowerCase();const known=AGENT_ALIASES[raw]||AGENT_ALIASES[lower];if(known)return known;if(lower.startsWith('agent-'))return 'agent-'+slugAgentId(lower.slice(6));return 'agent-'+slugAgentId(lower);}
 function agentFromSource(s){const m=String(s??'').match(/^agent:([^:]+):os$/);return m?m[1]:'';}
-function agentIdFor(e){return normalizeAgentId(e.event?.agentId??e.event?.meta?.agent??agentFromSource(e.event?.source)??(e.event?.source==='claude-code-hook'?'claude-code-hook':''));}
+function agentIdFor(e){return normalizeAgentId(e.event?.agentId??e.agentId??e.event?.meta?.agentId??e.event?.meta?.agent??agentFromSource(e.event?.source)??(e.event?.source==='claude-code-hook'?'claude-code-hook':''));}
+function roleForAgentId(id){return id==='claude-code-hook'?'runtime':String(id??'').replace(/^agent-/,'');}
+function agentTitle(id){const role=roleForAgentId(id);const m=ROLE_META[role];if(m)return m.label;return 'Agent · '+role;}
+function agentSubtitle(id){const role=roleForAgentId(id);const m=ROLE_META[role];return m?m.sub:'PID / OS Guard events';}
+function agentIcon(id){const role=roleForAgentId(id);return ROLE_META[role]?.icon||'🤖';}
+function agentIdsForModel(model){const ids=new Set(BASE_AGENT_IDS);for(const flow of(model.agentFlows||[])){if(flow.agentId)ids.add(flow.agentId);}for(const e of(model.events||[])){const id=agentIdFor(e);if(id)ids.add(id);}return [...ids];}
 function bdg(s){return '<span class="badge badge-'+h(s)+'">'+h(s)+'</span>';}
 function sevPill(s){return '<span class="sev '+h(SEV_CLS[s]||'low')+'">'+h(s)+'</span>';}
 
@@ -1605,7 +1581,7 @@ function renderAgentFlows(model){
   const stats=model.agentStats||[];
   if(!flows.length){document.getElementById('agent-flows').innerHTML='<div class="afc-empty" style="padding:32px;font-size:13px;color:var(--muted);">실행 중인 에이전트가 없습니다.</div>';return;}
   document.getElementById('agent-flows').innerHTML=flows.map(flow=>{
-    const m=ROLE_META[flow.role]||{label:flow.role,icon:'🤖',sub:''};
+    const m=ROLE_META[flow.role]||{label:agentTitle(flow.agentId),icon:agentIcon(flow.agentId),sub:agentSubtitle(flow.agentId)};
     const od=flow.overallDecision||'idle';
     const st=stats.find(s=>s.role===flow.role)||{block:0,warn:0};
     const miniStats=(st.block>0?'<span style="color:var(--block);">'+st.block+' Blocked</span>':'')+
@@ -1651,7 +1627,7 @@ function renderVisionFlow(model){
   const el=document.getElementById('vision-flow');
   if(!vf){el.innerHTML='<div class="vf-empty"><code>node src/cli.js scan-image --file &lt;image-path&gt;</code> to display detection results. Demo: <code>npm run demo:image</code> → <code>node src/cli.js scan-image --file examples/generated/attack-image.svg</code></div>';return;}
   const stages=[
-    {icon:'🖼',label:'Image Upload',detail:vf.imagePath?vf.imagePath.split('/').at(-1):'No file',cls:''},
+    {icon:'🖼',label:'Image Input',detail:vf.imagePath?vf.imagePath.split('/').at(-1):'No file',cls:''},
     {icon:'👁',label:'OCR / VLM Analysis',detail:'Confidence: '+(vf.confidence!=null?(vf.confidence*100).toFixed(0)+'%':'—')+(vf.hiddenPrompts.length?' · hidden text '+(vf.hiddenPrompts.length)+'':''),cls:vf.hiddenPrompts.length?'block':'allow'},
     {icon:'🛡',label:'Rule-based Check',detail:(vf.findings[0]?.id||'Rules applied'),cls:vf.decision},
     {icon:vf.decision==='block'?'🚫':'✅',label:vf.decision==='block'?'Blocked':'Allowed',detail:vf.findings[0]?.rationale?.slice(0,50)||'',cls:vf.decision}
@@ -1712,6 +1688,7 @@ function groupByTimeWindow(events,windowMin){
 function renderAgentSummaryHeader(agentId,events){
   const el=document.getElementById('hist-agent-summary');
   if(!agentId){el.style.display='none';return;}
+  if(agentId.startsWith('rt:')){el.style.display='none';return;}
   const ae=events.filter(e=>agentIdFor(e)===agentId);
   const bk=ae.filter(e=>e.decision==='block').length;
   const wn=ae.filter(e=>e.decision==='warn').length;
@@ -1721,7 +1698,7 @@ function renderAgentSummaryHeader(agentId,events){
   for(const e of ae.filter(e=>e.decision==='block')){for(const f of(e.findings??[])){ruleFreq[f.id]=(ruleFreq[f.id]??0)+1;}}
   const topRules=Object.entries(ruleFreq).sort((a,b)=>b[1]-a[1]).slice(0,3);
   const role=agentId==='claude-code-hook'?'runtime':agentId.replace('agent-','');
-  const m=ROLE_META[role]||{icon:'🤖',label:agentId,sub:''};
+  const m=ROLE_META[role]||{icon:agentIcon(agentId),label:agentTitle(agentId),sub:agentSubtitle(agentId)};
   el.style.display='flex';
   el.innerHTML='<div class="has-icon">'+m.icon+'</div>'+
     '<div class="has-info"><div class="has-name">'+h(m.label)+' <span style="font-size:12px;font-weight:400;color:var(--muted);">'+h(m.sub)+'</span></div>'+
@@ -1795,7 +1772,7 @@ function renderAgentColumnInner(label,sub,icon,ae,now,maxRows){
 
 function renderAgentColumn(agentId,events,now,maxRows){
   const role=agentId==='claude-code-hook'?'runtime':agentId.replace('agent-','');
-  const m=ROLE_META[role]||{icon:'🤖',label:agentId,sub:''};
+  const m=ROLE_META[role]||{icon:agentIcon(agentId),label:agentTitle(agentId),sub:agentSubtitle(agentId)};
   const ae=events.filter(e=>agentIdFor(e)===agentId);
   return renderAgentColumnInner(m.label,m.sub,m.icon,ae,now,maxRows);
 }
@@ -1808,10 +1785,11 @@ function renderAgentColumnForSession(agentId,sessionEvents,now,maxRows,shortSid)
 
 function sessionIdFor(e){return e.event?.meta?.sessionId??'';}
 
-function buildRuntimeSessionTabs(events){
+function buildRuntimeSessionTabs(events,model){
   const tabsEl=document.getElementById('hist-agent-tabs');
   // Remove old dynamic runtime tabs
   tabsEl.querySelectorAll('.hist-agent-tab[data-rt-session]').forEach(b=>b.remove());
+  tabsEl.querySelectorAll('.hist-agent-tab[data-dynamic-agent]').forEach(b=>b.remove());
   // Collect runtime sessions
   const rtEvents=events.filter(e=>agentIdFor(e)==='claude-code-hook');
   const sessions={};
@@ -1865,6 +1843,27 @@ function buildRuntimeSessionTabs(events){
       sel.insertBefore(opt,qaOpt);
     }
   }
+  const dynamicAgents=agentIdsForModel(model).filter(id=>!BASE_AGENT_IDS.includes(id));
+  const insertAfter=tabsEl.querySelector('[data-agent="agent-security"]')||tabsEl.lastElementChild;
+  let anchor=insertAfter?.nextSibling||null;
+  for(const id of dynamicAgents){
+    const count=events.filter(e=>agentIdFor(e)===id).length;
+    const btn=document.createElement('button');
+    btn.className='hist-agent-tab'+(historyAgentFilter===id?' active':'');
+    btn.dataset.agent=id;
+    btn.dataset.dynamicAgent='1';
+    btn.textContent=agentIcon(id)+' '+roleForAgentId(id)+(count?' ('+count+')':'');
+    btn.title=agentTitle(id);
+    tabsEl.insertBefore(btn,anchor);
+  }
+  sel.querySelectorAll('option[data-dynamic-agent]').forEach(o=>o.remove());
+  for(const id of dynamicAgents){
+    const count=events.filter(e=>agentIdFor(e)===id).length;
+    const opt=document.createElement('option');
+    opt.value=id;opt.dataset.dynamicAgent='1';
+    opt.textContent=roleForAgentId(id)+(count?' ('+count+')':'');
+    sel.appendChild(opt);
+  }
 }
 
 function filterEventsByAgent(events,fa){
@@ -1882,7 +1881,8 @@ function renderHistory(model){
   const fa=document.getElementById('f-agent').value||historyAgentFilter;
   const now=Date.now();
 
-  buildRuntimeSessionTabs(events);
+  buildRuntimeSessionTabs(events,model);
+  if(fa)document.getElementById('f-agent').value=fa;
 
   const preFiltered=events.filter(e=>(!fd||e.decision===fd)&&(!fs||surf(e)===fs));
 
@@ -1890,7 +1890,7 @@ function renderHistory(model){
   if(!fa){
     renderAgentSummaryHeader('',events);
     document.getElementById('hist-count').textContent='Total '+preFiltered.length;
-    const agents=['claude-code-hook','agent-qa','agent-backend','agent-security'];
+    const agents=agentIdsForModel(model);
     const unassigned=preFiltered.filter(e=>!agents.includes(agentIdFor(e)));
     let html='<div class="hist-agent-grid">'+
       agents.map(aid=>renderAgentColumn(aid,preFiltered,now,20)).join('')+
@@ -1909,7 +1909,7 @@ function renderHistory(model){
 
   // ── Single agent mode: summary header and grouped timeline ────────────────
   renderAgentSummaryHeader(fa,events);
-  const filtered=preFiltered.filter(e=>agentIdFor(e)===fa);
+  const filtered=filterEventsByAgent(preFiltered,fa);
   document.getElementById('hist-count').textContent='Total '+filtered.length;
 
   if(!filtered.length){
@@ -2023,7 +2023,7 @@ function renderForensics(model){
   html+='<div class="panel"><div class="panel-hd"><h2>Prompt Injection Detection</h2><span class="pill inject">'+disc.length+' found</span></div><div class="panel-bd">';
   html+=disc.length
     ?disc.map(d=>'<div class="disc-card" style="margin-bottom:10px;"><div class="disc-top"><span class="disc-title">Injection found</span><span class="pill inject sm">Hidden Prompts</span></div><div class="disc-meta">'+fmtFull(d.timestamp)+(d.imagePath?' · '+h(d.imagePath):'')+'</div><div class="disc-text"><code>'+h(d.prompt)+'</code></div></div>').join('')
-    :'<div class="empty">No prompt injections were found in analyzed images.<br><code style="font-size:11px;">scan-image --file &lt;image&gt;</code> to analyze an image.</div>';
+    :'<div class="empty">자동 수집된 이미지에서 prompt injection이 발견되지 않았습니다.</div>';
   html+='</div></div>';
   if(imgs.length){
     html+=imgs.map(item=>{
@@ -2035,7 +2035,7 @@ function renderForensics(model){
       return '<div class="img-card"><div class="img-card-hd"><div style="display:flex;align-items:center;gap:8px;">'+bdg('image')+'<strong>'+h(item.imageId||item.eventId||'Image Event')+'</strong></div><div style="display:flex;align-items:center;gap:8px;"><span class="pill '+item.decision+'">'+ST_LABEL[item.decision]+'</span><span style="font-size:11px;color:var(--muted);">'+fmtFull(item.timestamp)+'</span></div></div><div class="img-card-bd">'+(iSrc?'<div class="img-frame"><img src="'+h(iSrc)+'" alt="Evidence image" onerror="this.style.display=\\'none\\';this.nextElementSibling.style.display=\\'block\\'"><div class="img-missing">Image file unavailable — showing extracted text</div>'+rBoxes+oBoxes+'</div>':'<div class="img-frame"><div class="img-missing" style="display:block;">No image path</div></div>')+'<div class="img-info">'+injHtml+(item.extractedText?'<div><span class="lbl-sm">Extracted Text</span><div class="ocr"><code>'+h(item.extractedText)+'</code></div></div>':'')+(fHtml?'<div><span class="lbl-sm">Findings</span><div class="finding-list">'+fHtml+'</div></div>':'')+'<div style="font-size:11px;color:var(--muted);">Hash: <code>'+h((item.imageHash||'').slice(0,16))+'</code> · Confidence: '+h(item.confidence??'n/a')+'</div></div></div></div>';
     }).join('');
   } else {
-    html+='<div class="panel"><div class="panel-bd" style="padding:16px;"><div class="empty">No image analysis results. Run <code>scan-image --file &lt;path&gt;</code> to analyze an image.</div></div></div>';
+    html+='<div class="panel"><div class="panel-bd" style="padding:16px;"><div class="empty">아직 이미지 분석 이벤트가 없습니다. 에이전트로 들어온 이미지가 감지되면 여기에 표시됩니다.</div></div></div>';
   }
   document.getElementById('foren-content').innerHTML=html;
 }
@@ -2304,82 +2304,6 @@ sse.onerror=()=>{
   document.getElementById('updated').textContent='Reconnecting...';
 };
 
-// ── Image Upload ──────────────────────────────────────────────────────────────
-(function(){
-  const dropZone=document.getElementById('drop-zone');
-  const fileInput=document.getElementById('file-input');
-  const statusEl=document.getElementById('upload-status');
-  const progressEl=document.getElementById('upload-progress');
-  const msgEl=document.getElementById('upload-msg');
-  const resultEl=document.getElementById('upload-result');
-  if(!dropZone)return;
-
-  dropZone.addEventListener('click',()=>fileInput.click());
-  fileInput.addEventListener('change',()=>{if(fileInput.files.length>0)uploadFile(fileInput.files[0]);});
-  dropZone.addEventListener('dragover',e=>{e.preventDefault();dropZone.classList.add('dragover');});
-  dropZone.addEventListener('dragleave',()=>dropZone.classList.remove('dragover'));
-  dropZone.addEventListener('drop',e=>{e.preventDefault();dropZone.classList.remove('dragover');const f=e.dataTransfer.files[0];if(f)uploadFile(f);});
-
-  async function uploadFile(file){
-    const ALLOWED=['image/png','image/jpeg','image/gif','image/webp'];
-    if(!ALLOWED.includes(file.type)){alert('지원하지 않는 파일 형식입니다. PNG, JPG, GIF, WebP만 가능합니다.');return;}
-    if(file.size>10*1024*1024){alert('파일이 너무 큽니다. 최대 10MB까지 가능합니다.');return;}
-
-    dropZone.classList.add('uploading');
-    statusEl.style.display='block';
-    progressEl.style.display='flex';
-    msgEl.textContent='이미지 업로드 중... ('+(file.size/1024).toFixed(0)+' KB)';
-    resultEl.style.display='none';
-
-    try{
-      const fd=new FormData();
-      fd.append('image',file);
-      msgEl.textContent='Vision AI 분석 중... (최대 30초 소요)';
-
-      const resp=await fetch('/api/scan-image',{method:'POST',body:fd});
-      const data=await resp.json();
-      if(!resp.ok)throw new Error(data.error||'Upload failed');
-
-      progressEl.style.display='none';
-      resultEl.style.display='block';
-      const d=data.decision||'allow';
-      const findings=data.findings||[];
-      const hPrompts=data.event?.evidence?.hiddenPrompts||[];
-
-      let html='<div class="upload-result-card '+d+'">';
-      html+='<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">';
-      html+='<span class="pill '+d+'">'+ST_LABEL[d]+'</span>';
-      html+='<strong>'+h(file.name)+'</strong>';
-      if(data.severity)html+=sevPill(data.severity);
-      html+='</div>';
-
-      if(hPrompts.length){
-        html+='<div style="margin-bottom:8px;padding:8px;background:#f5f3ff;border:1px solid #ddd6fe;border-radius:6px;">';
-        html+='<strong style="color:#7c3aed;font-size:10px;text-transform:uppercase;">숨겨진 프롬프트 '+hPrompts.length+'건</strong>';
-        hPrompts.forEach(p=>{html+='<div style="margin-top:4px;"><code style="color:#7c3aed;font-size:11px;">'+h(p)+'</code></div>';});
-        html+='</div>';
-      }
-
-      if(findings.length){
-        html+='<div style="display:flex;flex-direction:column;gap:4px;">';
-        findings.forEach(f=>{html+='<div style="display:flex;align-items:center;gap:6px;font-size:12px;">'+sevPill(f.severity)+'<strong>'+h(f.id)+'</strong><span style="color:var(--muted);">'+h(f.rationale||'')+'</span></div>';});
-        html+='</div>';
-      } else {
-        html+='<div style="font-size:12px;color:var(--muted);">위협이 감지되지 않았습니다.</div>';
-      }
-
-      html+='</div>';
-      resultEl.innerHTML=html;
-    }catch(err){
-      progressEl.style.display='none';
-      resultEl.style.display='block';
-      resultEl.innerHTML='<div style="padding:10px;background:#fef2f2;border:1px solid var(--block);border-radius:6px;font-size:12px;color:var(--block);">오류: '+h(err.message)+'</div>';
-    }finally{
-      dropZone.classList.remove('uploading');
-      fileInput.value='';
-    }
-  }
-})();
 </script>
 </body>
 </html>`;
