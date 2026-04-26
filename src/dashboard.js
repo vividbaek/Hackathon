@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createServer } from 'node:http';
-import { readFile, mkdir, writeFile } from 'node:fs/promises';
+import { readFile, mkdir, writeFile, readdir } from 'node:fs/promises';
 import { extname, join, resolve, sep } from 'node:path';
 import { loadConfig } from './config.js';
 import { createVisionProviderFromConfig } from './providers/vision-llm.js';
@@ -293,13 +293,17 @@ function buildLayerOverview(events, candidates) {
     const block = layerEvents.filter(e => e.decision === 'block').length;
     const warn = layerEvents.filter(e => e.decision === 'warn').length;
     const ruleSet = new Set();
+    let latest = null;
     for (const e of layerEvents) {
       for (const f of e.findings ?? []) { if (f.id) ruleSet.add(f.id); }
+      const ts = eventTime(e);
+      if (ts && (!latest || Date.parse(ts) > Date.parse(latest))) latest = ts;
     }
     const layerCandidates = candidates.filter(c => {
       const cSurface = c.rule?.surface ?? c.surface ?? '';
       return layer.surfaces.includes(cSurface);
     });
+    const status = block > 0 ? 'block' : warn > 0 ? 'warn' : layerEvents.length > 0 ? 'allow' : 'idle';
     return {
       ...layer,
       total: layerEvents.length,
@@ -307,7 +311,9 @@ function buildLayerOverview(events, candidates) {
       warn,
       topRule: ruleSet.size > 0 ? [...ruleSet][0] : null,
       ruleCount: ruleSet.size,
-      candidateCount: layerCandidates.length
+      candidateCount: layerCandidates.length,
+      status,
+      latest
     };
   });
 }
@@ -351,60 +357,6 @@ function guardLayerLabel(surface) {
     output: 'Output Guard',
     os: 'ES Guard'
   }[surface] ?? `${surface} Guard`;
-}
-
-const layerDefinitions = [
-  { id: 'prompt', label: 'Prompt Guard', surfaces: ['prompt'] },
-  { id: 'shell', label: 'Shell Guard', surfaces: ['command'] },
-  { id: 'es', label: 'ES Guard', surfaces: ['os'] },
-  { id: 'output', label: 'Output Guard', surfaces: ['output'] },
-  { id: 'screen', label: 'Screen Watch', surfaces: ['image', 'vision_observation'] }
-];
-
-function layerForSurface(surface) {
-  return layerDefinitions.find(layer => layer.surfaces.includes(surface)) ?? null;
-}
-
-function buildLayerOverview(events) {
-  const overview = layerDefinitions.map(layer => ({
-    id: layer.id,
-    label: layer.label,
-    surfaces: layer.surfaces,
-    total: 0,
-    block: 0,
-    warn: 0,
-    allow: 0,
-    topRule: null,
-    latest: null,
-    status: 'idle'
-  }));
-  const byId = Object.fromEntries(overview.map(layer => [layer.id, layer]));
-  const ruleCounts = Object.fromEntries(overview.map(layer => [layer.id, {}]));
-
-  for (const ev of events) {
-    const surface = ev.surface ?? ev.event?.type ?? 'unknown';
-    const layer = layerForSurface(surface);
-    if (!layer) continue;
-    const item = byId[layer.id];
-    const decision = ev.decision ?? 'allow';
-    item.total += 1;
-    if (decision === 'block') item.block += 1;
-    else if (decision === 'warn') item.warn += 1;
-    else if (decision === 'allow') item.allow += 1;
-
-    const ts = eventTime(ev);
-    if (ts && (!item.latest || Date.parse(ts) > Date.parse(item.latest))) item.latest = ts;
-    for (const finding of ev.findings ?? []) {
-      if (!finding.id) continue;
-      ruleCounts[layer.id][finding.id] = (ruleCounts[layer.id][finding.id] ?? 0) + 1;
-    }
-  }
-
-  for (const item of overview) {
-    item.status = item.block > 0 ? 'block' : item.warn > 0 ? 'warn' : item.total > 0 ? 'allow' : 'idle';
-    item.topRule = Object.entries(ruleCounts[item.id]).sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
-  }
-  return overview;
 }
 
 function taskOperation(ev) {
@@ -577,7 +529,6 @@ export function buildDashboardModel({ events = [], candidates = [], state = {}, 
     state,
     counts: summarizeCounts(recentEvents, candidateList),
     safetyScore: computeSafetyScore(recentEvents, candidateList),
-    layerOverview: buildLayerOverview(recentEvents),
     agentStats: computeAgentStats(recentEvents),
     agents,
     edges: graphEdges.map(([from, to]) => ({ from, to })),
@@ -706,6 +657,60 @@ export function createDashboardServer({ dataDir = '.404gent' } = {}) {
       }
       if (url.pathname === '/api/status') { sendJson(res, await readDashboardModel({ dataDir })); return; }
       if (url.pathname === '/api/image') { await sendEvidenceImage(res, url.searchParams.get('path')); return; }
+
+      // ── Image Gallery: list all images with scan results ──────────────────
+      if (url.pathname === '/api/images') {
+        const rawDir = join(dataDir, 'images', 'raw');
+        let files = [];
+        try { files = await readdir(rawDir); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+        files = files.filter(f => /\.(png|jpe?g|gif|webp)$/i.test(f)).sort().reverse();
+        const config = await getConfig();
+        const images = await Promise.all(files.map(async (f) => {
+          const imageId = f.replace(/\.[^.]+$/, '');
+          const rawPath = `images/raw/${f}`;
+          const normalizedPath = `images/normalized/${imageId}.normalized.png`;
+          const preprocessedPath = join(dataDir, 'preprocessed', `${imageId}.json`);
+          let preprocessed = null;
+          try { preprocessed = JSON.parse(await readFile(preprocessedPath, 'utf8')); } catch {}
+          let scanResult = null;
+          if (preprocessed) {
+            const detections = preprocessed.detections ?? [];
+            const hiddenTexts = detections.filter(d => d.kind === 'hidden_text').map(d => d.text);
+            const allTexts = detections.map(d => d.text);
+            const scanInput = [...hiddenTexts, ...allTexts].filter(Boolean).join('\n');
+            const hiddenCount = hiddenTexts.length;
+            const ocrCount = detections.filter(d => d.kind === 'ocr_text').length;
+            const result = scanText({ surface: 'image', text: scanInput, config, evidence: { hiddenPrompts: hiddenTexts.length ? [hiddenTexts.join(' ')] : [] } });
+            scanResult = { decision: result.decision, findings: result.findings ?? [], hiddenCount, ocrCount };
+          }
+          return { imageId, rawPath, normalizedPath, preprocessed: !!preprocessed, scanResult };
+        }));
+        sendJson(res, { images });
+        return;
+      }
+
+      // ── Scan existing image from .404gent/images/raw/ ─────────────────────
+      if (req.method === 'POST' && url.pathname === '/api/scan-existing') {
+        const body = JSON.parse(await readRawBody(req, 1024 * 64));
+        const imageId = body.imageId;
+        if (!imageId || /[\/\\]/.test(imageId)) { sendJsonError(res, 400, 'Invalid imageId'); return; }
+        const rawDir = join(dataDir, 'images', 'raw');
+        let rawFiles = [];
+        try { rawFiles = await readdir(rawDir); } catch {}
+        const rawFile = rawFiles.find(f => f.startsWith(imageId));
+        if (!rawFile) { sendJsonError(res, 404, 'Image not found'); return; }
+        const rawPath = join(rawDir, rawFile);
+        const config = await getConfig();
+        const preprocessResult = await preprocessImage(rawPath, config, { quiet: true, imageId });
+        const detections = preprocessResult.preprocessed?.detections ?? [];
+        const hiddenTexts = detections.filter(d => d.kind === 'hidden_text').map(d => d.text);
+        const allTexts = detections.map(d => d.text);
+        const scanInput = [...hiddenTexts, ...allTexts].filter(Boolean).join('\n');
+        const result = scanText({ surface: 'image', text: scanInput, config, evidence: { hiddenPrompts: hiddenTexts.length ? [hiddenTexts.join(' ')] : [] } });
+        await recordReport(result, config);
+        sendJson(res, { ok: true, imageId, scanResult: { decision: result.decision, findings: result.findings ?? [], hiddenCount: hiddenTexts.length, ocrCount: detections.filter(d => d.kind === 'ocr_text').length } });
+        return;
+      }
 
       // ── Image Upload Scan ─────────────────────────────────────────────────
       if (req.method === 'POST' && url.pathname === '/api/scan-image') {
@@ -1278,6 +1283,36 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
 .hac-footer{padding:8px 14px;border-top:1px solid var(--border);text-align:center;}
 .hac-footer button{border:none;background:none;color:var(--accent);font-size:11px;font-weight:700;cursor:pointer;font-family:inherit;padding:4px 8px;border-radius:4px;}
 .hac-footer button:hover{background:#eef2ff;}
+
+/* Image Gallery */
+.img-gallery-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(420px,1fr));gap:16px;}
+@media(max-width:900px){.img-gallery-grid{grid-template-columns:1fr;}}
+.ig-card{background:var(--panel);border:1px solid var(--border);border-radius:var(--r);overflow:hidden;transition:border-color .2s,box-shadow .2s;}
+.ig-card.threat{border-color:#fca5a5;box-shadow:0 0 0 3px rgba(220,38,38,.08);}
+.ig-card.safe{border-color:#6ee7b7;}
+.ig-card.unscanned{border-color:#e5e7eb;border-style:dashed;}
+.ig-card-hd{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-bottom:1px solid var(--border);background:var(--bg);}
+.ig-card-hd .ig-id{font-size:12px;font-weight:700;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.ig-card-bd{display:grid;grid-template-columns:1fr 1fr;gap:0;}
+.ig-img-wrap{position:relative;background:#0f172a;display:flex;align-items:center;justify-content:center;min-height:160px;overflow:hidden;}
+.ig-img-wrap img{display:block;width:100%;max-height:200px;object-fit:contain;}
+.ig-info{padding:14px;display:flex;flex-direction:column;gap:8px;}
+.ig-verdict{display:flex;align-items:center;gap:8px;font-size:14px;font-weight:800;}
+.ig-verdict.safe{color:var(--allow);}
+.ig-verdict.threat{color:var(--block);}
+.ig-verdict.warn{color:var(--warn);}
+.ig-verdict.unscanned{color:var(--muted);}
+.ig-stats{display:flex;gap:12px;}
+.ig-stat{display:flex;flex-direction:column;align-items:center;padding:6px 10px;border:1px solid var(--border);border-radius:6px;min-width:60px;}
+.ig-stat strong{font-size:18px;font-weight:800;line-height:1;}
+.ig-stat span{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin-top:2px;}
+.ig-stat.danger strong{color:var(--block);}
+.ig-detections{display:flex;flex-direction:column;gap:3px;max-height:80px;overflow-y:auto;}
+.ig-det{font-size:11px;display:flex;align-items:center;gap:4px;}
+.ig-det code{font-size:10px;color:var(--inject);background:#f5f3ff;padding:1px 4px;border-radius:3px;}
+.ig-scan-btn{padding:8px 16px;border:2px solid var(--accent);background:#eef2ff;color:var(--accent);border-radius:8px;font-size:12px;font-weight:700;cursor:pointer;transition:all .15s;font-family:inherit;}
+.ig-scan-btn:hover{background:var(--accent);color:#fff;}
+.ig-scan-btn:disabled{opacity:.5;cursor:not-allowed;}
 </style>
 </head>
 <body>
@@ -1412,6 +1447,14 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
 <!-- Image Forensics -->
 <div class="tab-panel" id="panel-forensics">
   <div class="foren-wrap">
+    <div class="panel">
+      <div class="panel-hd"><h2>이미지 분석 갤러리</h2><span style="font-size:11px;color:var(--muted);">.404gent/images 경로의 이미지를 자동 분석합니다</span></div>
+      <div class="panel-bd">
+        <div id="img-gallery" class="img-gallery-grid">
+          <div class="empty">이미지를 불러오는 중...</div>
+        </div>
+      </div>
+    </div>
     <div class="panel" id="upload-panel">
       <div class="panel-hd"><h2>이미지 업로드 스캔</h2><span style="font-size:11px;color:var(--muted);">PNG, JPG, GIF, WebP (최대 10MB)</span></div>
       <div class="panel-bd" style="padding:16px;">
@@ -1587,6 +1630,9 @@ function renderAgentFlows(model){
     const sessionBadge=flow.sessionCount>1
       ?'<span title="'+flow.sessionCount+' sessions with recent task logs" style="font-size:10px;background:#e0e7ff;color:#4338ca;border-radius:4px;padding:1px 5px;margin-left:4px;">Sessions '+flow.sessionCount+(flow.recentSessionCount>1?' · '+flow.recentSessionCount+' active':'')+'</span>'
       :'';
+    const label=m.label;
+    const sub=m.sub;
+    const recentDot=flow.lastSeen&&(Date.now()-Date.parse(flow.lastSeen))<5*60*1000?' <span style="color:#22c55e;">\u25CF</span>':'';
     return '<div class="afc-col '+od+'" data-agent-id="'+flow.agentId+'">'+
       '<div class="afc-header">'+
         '<span class="afc-icon">'+m.icon+'</span>'+
@@ -1886,6 +1932,89 @@ function renderHistory(model){
   document.getElementById('hist-list').innerHTML=html;
 }
 
+// ── Image Gallery ─────────────────────────────────────────────────────────────
+let galleryLoaded=false;
+async function loadImageGallery(){
+  const el=document.getElementById('img-gallery');
+  if(!el)return;
+  try{
+    const resp=await fetch('/api/images');
+    const data=await resp.json();
+    const images=data.images||[];
+    if(!images.length){el.innerHTML='<div class="empty">.404gent/images 경로에 이미지가 없습니다.</div>';return;}
+    el.innerHTML=images.map(img=>{
+      const sr=img.scanResult;
+      const hasPreprocessed=img.preprocessed;
+      const rawSrc='/api/image?path='+encodeURIComponent(img.rawPath);
+      const normSrc=hasPreprocessed?'/api/image?path='+encodeURIComponent(img.normalizedPath):'';
+
+      if(!hasPreprocessed){
+        return '<div class="ig-card unscanned">'+
+          '<div class="ig-card-hd"><span class="ig-id">'+h(img.imageId)+'</span><span class="pill idle">미분석</span></div>'+
+          '<div class="ig-card-bd">'+
+            '<div class="ig-img-wrap"><img src="'+h(rawSrc)+'" alt="raw"></div>'+
+            '<div class="ig-info">'+
+              '<div class="ig-verdict unscanned">⏳ 미분석 이미지</div>'+
+              '<div style="font-size:11px;color:var(--muted);">아직 보안 스캔이 수행되지 않았습니다.</div>'+
+              '<button class="ig-scan-btn" onclick="scanExistingImage(this,\''+h(img.imageId)+'\')">스캔 시작</button>'+
+            '</div>'+
+          '</div></div>';
+      }
+
+      const decision=sr?.decision||'allow';
+      const hiddenCount=sr?.hiddenCount||0;
+      const ocrCount=sr?.ocrCount||0;
+      const findings=sr?.findings||[];
+      const isThreat=decision==='block';
+      const isWarn=decision==='warn';
+      const verdictCls=isThreat?'threat':isWarn?'warn':'safe';
+      const verdictIcon=isThreat?'🚫':isWarn?'⚠️':'✅';
+      const verdictText=isThreat?'THREAT DETECTED':isWarn?'WARNING':'SAFE';
+      const cardCls=isThreat?'threat':isWarn?'':'safe';
+
+      const topFindings=findings.slice(0,3).map(f=>
+        '<div class="ig-det">'+sevPill(f.severity)+'<code>'+h(f.id)+'</code></div>'
+      ).join('');
+
+      return '<div class="ig-card '+cardCls+'">'+
+        '<div class="ig-card-hd"><span class="ig-id">'+h(img.imageId)+'</span><span class="pill '+decision+'">'+(ST_LABEL[decision]||decision)+'</span></div>'+
+        '<div class="ig-card-bd">'+
+          '<div class="ig-img-wrap"><img src="'+h(normSrc||rawSrc)+'" alt="analyzed"></div>'+
+          '<div class="ig-info">'+
+            '<div class="ig-verdict '+verdictCls+'">'+verdictIcon+' '+verdictText+'</div>'+
+            '<div class="ig-stats">'+
+              '<div class="ig-stat'+(hiddenCount>0?' danger':'')+'"><strong>'+hiddenCount+'</strong><span>Hidden</span></div>'+
+              '<div class="ig-stat"><strong>'+ocrCount+'</strong><span>OCR</span></div>'+
+              '<div class="ig-stat"><strong>'+findings.length+'</strong><span>Findings</span></div>'+
+            '</div>'+
+            (topFindings?'<div class="ig-detections">'+topFindings+'</div>':
+             '<div style="font-size:11px;color:var(--allow);">위협이 감지되지 않았습니다.</div>')+
+          '</div>'+
+        '</div></div>';
+    }).join('');
+    galleryLoaded=true;
+  }catch(err){
+    el.innerHTML='<div class="empty" style="color:var(--block);">갤러리 로드 실패: '+h(err.message)+'</div>';
+  }
+}
+
+async function scanExistingImage(btn,imageId){
+  btn.disabled=true;
+  btn.textContent='분석 중...';
+  try{
+    const resp=await fetch('/api/scan-existing',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({imageId})});
+    const data=await resp.json();
+    if(!resp.ok)throw new Error(data.error||'Scan failed');
+    btn.textContent='완료! 새로고침 중...';
+    galleryLoaded=false;
+    setTimeout(()=>loadImageGallery(),500);
+  }catch(err){
+    btn.disabled=false;
+    btn.textContent='스캔 실패 - 재시도';
+    alert('스캔 오류: '+err.message);
+  }
+}
+
 // ── Image forensics tab ──────────────────────────────────────────────────────
 function renderForensics(model){
   const disc=model.hiddenPromptDiscoveries||[];
@@ -2146,6 +2275,7 @@ function renderAll(model){
     renderHistory(model);
   } else if(activeTab==='forensics'){
     renderForensics(model);
+    if(!galleryLoaded)loadImageGallery();
   } else if(activeTab==='self-healing'){
     renderSelfHealing(model);
   } else if(activeTab==='rules'){
