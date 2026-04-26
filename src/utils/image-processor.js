@@ -126,7 +126,7 @@ export async function applyEdgeDetect(input) {
 }
 
 // 9. [Visualization] Draw Bounding Boxes
-export async function drawBoundingBoxes(input, hiddenWords, targetWidth = 2000) {
+export async function drawBoundingBoxes(input, hiddenAttacks, targetWidth = 2000) {
   const normalizedBase = await sharp(input, { density: 300 })
     .resize({ width: targetWidth })
     .toBuffer();
@@ -134,57 +134,35 @@ export async function drawBoundingBoxes(input, hiddenWords, targetWidth = 2000) 
   const meta = await sharp(normalizedBase).metadata();
   const { width, height } = meta;
 
-  // --- 1. Group Words into Lines/Sentences ---
-  const groups = [];
-  if (hiddenWords.length > 0) {
-    // Sort by Y then X
-    const sorted = [...hiddenWords].sort((a, b) => (a.bbox.y - b.bbox.y) || (a.bbox.x - b.bbox.x));
-    
-    let currentGroup = [sorted[0]];
-    for (let i = 1; i < sorted.length; i++) {
-      const last = currentGroup[currentGroup.length - 1];
-      const curr = sorted[i];
-      
-      const yDiff = Math.abs(curr.bbox.y - last.bbox.y);
-      const xDist = curr.bbox.x - (last.bbox.x + last.bbox.w);
-      
-      // If same line (Y diff < 15) and close horizontally (X dist < 40)
-      if (yDiff < 15 && xDist < 40) {
-        currentGroup.push(curr);
-      } else {
-        groups.push(currentGroup);
-        currentGroup = [curr];
-      }
-    }
-    groups.push(currentGroup);
-  }
-
-  // --- 2. Calculate Combined Boxes ---
-  const lineBoxes = groups.map(group => {
-    const minX = Math.min(...group.map(w => w.bbox.x));
-    const minY = Math.min(...group.map(w => w.bbox.y));
-    const maxX = Math.max(...group.map(w => w.bbox.x + w.bbox.w));
-    const maxY = Math.max(...group.map(w => w.bbox.y + w.bbox.h));
-    const combinedText = group.map(w => w.text).join(' ');
-    
-    return {
-      x: minX, y: minY, w: maxX - minX, h: maxY - minY,
-      text: combinedText
-    };
-  });
-
-  // --- 3. Create SVG Overlay ---
+  // --- Create SVG Overlay ---
   let svgParts = [
     `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg">`
   ];
 
-  lineBoxes.forEach(line => {
+  hiddenAttacks.forEach(attack => {
+    const isQr = attack.type === 'qr_code';
+    const color = isQr ? '#7C3AED' : 'red'; // Purple for QR, Red for Hidden Text
+    const bgColor = isQr ? 'rgba(124, 58, 237, 0.2)' : 'rgba(255, 0, 0, 0.2)';
+    const icon = isQr ? '📱' : '🚨';
+    const typeLabel = isQr ? `QR: ${attack.category}` : 'HIDDEN TEXT';
+    const sourceStr = attack.sources.join(', ');
+    
     svgParts.push(`
       <g>
-        <rect x="${line.x - 5}" y="${line.y - 5}" width="${line.w + 10}" height="${line.h + 10}" 
-              fill="rgba(255, 0, 0, 0.2)" stroke="red" stroke-width="4" rx="5" stroke-dasharray="8,4" />
-        <rect x="${line.x - 5}" y="${line.y - 45}" width="${Math.max(line.w + 10, line.text.length * 15 + 180)}" height="40" fill="red" rx="5" />
-        <text x="${line.x + 5}" y="${line.y - 15}" fill="white" font-family="monospace" font-size="24" font-weight="bold">🚨 HIDDEN ATTACK: ${line.text}</text>
+        <!-- Box -->
+        <rect x="${attack.x - 5}" y="${attack.y - 5}" width="${attack.w + 10}" height="${attack.h + 10}" 
+              fill="${bgColor}" stroke="${color}" stroke-width="4" rx="5" stroke-dasharray="${isQr ? '0' : '8,4'}" />
+        
+        <!-- Label Background -->
+        <rect x="${attack.x - 5}" y="${attack.y - 85}" width="${Math.max(attack.text.length * 15, (typeLabel.length + sourceStr.length) * 12 + 100)}" height="80" fill="${color}" rx="5" />
+        
+        <!-- Label Text -->
+        <text x="${attack.x + 5}" y="${attack.y - 50}" fill="white" font-family="monospace" font-size="22" font-weight="bold">
+          ${icon} ${typeLabel} (Score: ${attack.score})
+        </text>
+        <text x="${attack.x + 5}" y="${attack.y - 20}" fill="rgba(255,255,255,0.9)" font-family="monospace" font-size="18">
+          Payload: "${attack.text.length > 50 ? attack.text.substring(0, 47) + '...' : attack.text}"
+        </text>
       </g>
     `);
   });
