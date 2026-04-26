@@ -18,6 +18,19 @@ final class ESDaemonCoreTests: XCTestCase {
     XCTAssertTrue(client.isWatching(pid: 4321))
   }
 
+  func testExecFromWatchedParentAddsChildPID() async {
+    let client = ESClient()
+    client.addWatchedPID(4321)
+    await client.handleExec(argv: ["/bin/zsh", "-lc", "echo ok"], pid: 9876, parentPid: 4321, agent: "codex")
+    XCTAssertTrue(client.isWatching(pid: 9876))
+  }
+
+  func testExecFromUnwatchedParentDoesNotAddChildPID() async {
+    let client = ESClient()
+    await client.handleExec(argv: ["/bin/zsh"], pid: 9876, parentPid: 4321, agent: "codex")
+    XCTAssertFalse(client.isWatching(pid: 9876))
+  }
+
   func testConfigFromEnvironment() {
     let config = DaemonConfig.fromEnvironment([
       "FOURGENT_POLICY_ENDPOINT": "http://127.0.0.1:9999",

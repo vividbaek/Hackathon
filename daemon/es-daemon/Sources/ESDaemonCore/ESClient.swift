@@ -56,8 +56,10 @@ public final class ESClient {
     return decision
   }
 
-  public func handleExec(argv: [String], pid: Int32, agent: String?) async {
-    guard isWatching(pid: pid) else { return }
+  public func handleExec(argv: [String], pid: Int32, parentPid: Int32? = nil, agent: String?) async {
+    let parentIsWatched = parentPid.map { isWatching(pid: $0) } ?? false
+    guard isWatching(pid: pid) || parentIsWatched else { return }
+    addWatchedPID(pid)
     _ = await bridge.postExec(argv: argv, pid: pid, agent: agent)
   }
 
@@ -134,7 +136,10 @@ public final class ESClient {
 
   private func handleNotifyExec(_ message: UnsafePointer<es_message_t>) {
     let pid = pidForProcess(message.pointee.process)
-    guard isWatching(pid: pid) else { return }
+    let parentPid = parentPidForProcess(message.pointee.process)
+    let parentIsWatched = parentPid.map { isWatching(pid: $0) } ?? false
+    guard isWatching(pid: pid) || parentIsWatched else { return }
+    addWatchedPID(pid)
 
     let exec = message.pointee.event.exec
     let argv = argvForExec(exec)
@@ -145,6 +150,11 @@ public final class ESClient {
 
   private func pidForProcess(_ process: UnsafePointer<es_process_t>) -> Int32 {
     audit_token_to_pid(process.pointee.audit_token)
+  }
+
+  private func parentPidForProcess(_ process: UnsafePointer<es_process_t>) -> Int32? {
+    let ppid = process.pointee.ppid
+    return ppid > 0 ? ppid : nil
   }
 
   private func string(from token: es_string_token_t) -> String {

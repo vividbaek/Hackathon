@@ -34,6 +34,13 @@
     "expectedFinding": "os-destructive-exec"
   },
   {
+    "name": "sensitive unlink simulation",
+    "description": "AUTH_UNLINK is represented as a simulation event when native authorization is unavailable.",
+    "command": ["node", "src/cli.js", "os-guard", "simulate-unlink", ".404gent/os-guard-demo/.env", "--agent", "demo", "--pid", "1234"],
+    "expectedDecision": "block",
+    "expectedFinding": "os-sensitive-file-unlink"
+  },
+  {
     "name": "python bypass story",
     "description": "Native EndpointSecurity would observe Python open() as the same AUTH_OPEN file event.",
     "command": ["node", "src/cli.js", "os-guard", "simulate-open", ".404gent/os-guard-demo/.env", "--agent", "python-bypass", "--pid", "1234"],

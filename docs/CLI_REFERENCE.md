@@ -8,6 +8,7 @@ OS Guard commands:
 node src/cli.js os-guard simulate-open README.md --agent demo --pid 1234
 node src/cli.js os-guard simulate-open .env --agent demo --pid 1234
 node src/cli.js os-guard simulate-exec curl https://example.com/upload --agent demo --pid 1234
+node src/cli.js os-guard simulate-unlink .env --agent demo --pid 1234
 npm run demo:os-guard
 ```
 
