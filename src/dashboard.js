@@ -1386,10 +1386,6 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
   <div class="hist-wrap">
     <div class="hist-agent-tabs" id="hist-agent-tabs">
       <button class="hist-agent-tab active" data-agent="">All Timeline</button>
-      <button class="hist-agent-tab" data-agent="claude-code-hook">🧩 Runtime Hook</button>
-      <button class="hist-agent-tab" data-agent="agent-qa">🔍 QA Agent</button>
-      <button class="hist-agent-tab" data-agent="agent-backend">⚙️ Backend Agent</button>
-      <button class="hist-agent-tab" data-agent="agent-security">🛡 Security Agent</button>
     </div>
     <div class="hist-agent-summary" id="hist-agent-summary" style="display:none;"></div>
     <div class="hist-toolbar">
@@ -1419,10 +1415,6 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
         <label>Agent</label>
         <select id="f-agent">
           <option value="">All</option>
-          <option value="claude-code-hook">Runtime Hook</option>
-          <option value="agent-qa">QA Agent</option>
-          <option value="agent-backend">Backend Agent</option>
-          <option value="agent-security">Security Agent</option>
         </select>
       </div>
       <span class="tb-count" id="hist-count"></span>
@@ -1755,7 +1747,7 @@ function renderAgentColumnInner(label,sub,icon,ae,now,maxRows){
     }
   }
   const moreBtn=ae.length>shown.length
-    ?'<div class="hac-footer"><button onclick="document.querySelectorAll(\\'[data-agent=&quot;'+agentId+'&quot;]\\').forEach(b=>b.click())">+'+( ae.length-shown.length)+' more</button></div>':'';
+    ?'<div class="hac-footer"><button onclick="document.querySelectorAll(\\x27[data-agent=&quot;'+agentId+'&quot;]\\x27).forEach(b=>b.click())">+'+( ae.length-shown.length)+' more</button></div>':'';
   return '<div class="hist-agent-col '+borderCls+'">'+
     '<div class="hac-header">'+
       '<span class="hac-icon">'+icon+'</span>'+
@@ -1785,85 +1777,73 @@ function renderAgentColumnForSession(agentId,sessionEvents,now,maxRows,shortSid)
 
 function sessionIdFor(e){return e.event?.meta?.sessionId??'';}
 
-function buildRuntimeSessionTabs(events,model){
+function buildDynamicAgentTabs(events){
   const tabsEl=document.getElementById('hist-agent-tabs');
-  // Remove old dynamic runtime tabs
-  tabsEl.querySelectorAll('.hist-agent-tab[data-rt-session]').forEach(b=>b.remove());
-  tabsEl.querySelectorAll('.hist-agent-tab[data-dynamic-agent]').forEach(b=>b.remove());
-  // Collect runtime sessions
-  const rtEvents=events.filter(e=>agentIdFor(e)==='claude-code-hook');
-  const sessions={};
-  for(const e of rtEvents){
-    const sid=sessionIdFor(e)||'default';
-    if(!sessions[sid])sessions[sid]={count:0,lastTs:''};
-    sessions[sid].count++;
-    const ts=e.timestamp??e.scannedAt??'';
-    if(ts>sessions[sid].lastTs)sessions[sid].lastTs=ts;
-  }
-  const sorted=Object.entries(sessions).sort((a,b)=>b[1].lastTs.localeCompare(a[1].lastTs));
-  // Insert runtime session tabs after "전체" button
-  const allBtn=tabsEl.querySelector('[data-agent=""]');
-  const qaBtn=tabsEl.querySelector('[data-agent="agent-qa"]');
-  if(sorted.length<=1){
-    // Single or no session: show classic single tab
-    const btn=document.createElement('button');
-    btn.className='hist-agent-tab'+(historyAgentFilter==='claude-code-hook'?' active':'');
-    btn.dataset.agent='claude-code-hook';
-    btn.dataset.rtSession='1';
-    btn.textContent='🧩 Runtime Hook'+(sorted.length?(' ('+sorted[0][1].count+')'):'');
-    tabsEl.insertBefore(btn,qaBtn);
-  } else {
-    for(const [sid,info] of sorted){
-      const short=sid.length>8?sid.slice(0,8):sid;
-      const filterId='rt:'+sid;
-      const btn=document.createElement('button');
-      btn.className='hist-agent-tab'+(historyAgentFilter===filterId?' active':'');
-      btn.dataset.agent=filterId;
-      btn.dataset.rtSession='1';
-      btn.textContent='🧩 '+short+' ('+info.count+')';
-      btn.title='Runtime Hook · 세션 '+sid;
-      tabsEl.insertBefore(btn,qaBtn);
-    }
-  }
-  // Also update the f-agent dropdown
   const sel=document.getElementById('f-agent');
-  sel.querySelectorAll('option[data-rt-session]').forEach(o=>o.remove());
-  const qaOpt=sel.querySelector('option[value="agent-qa"]');
-  if(sorted.length<=1){
-    const opt=document.createElement('option');
-    opt.value='claude-code-hook';opt.dataset.rtSession='1';
-    opt.textContent='Runtime Hook'+(sorted.length?(' ('+sorted[0][1].count+')'):'');
-    sel.insertBefore(opt,qaOpt);
-  } else {
-    for(const [sid,info] of sorted){
-      const short=sid.length>8?sid.slice(0,8):sid;
-      const opt=document.createElement('option');
-      opt.value='rt:'+sid;opt.dataset.rtSession='1';
-      opt.textContent='Runtime · '+short+' ('+info.count+')';
-      sel.insertBefore(opt,qaOpt);
+  // Remove old dynamic tabs and dropdown options
+  tabsEl.querySelectorAll('.hist-agent-tab[data-dynamic]').forEach(b=>b.remove());
+  sel.querySelectorAll('option[data-dynamic]').forEach(o=>o.remove());
+
+  // Collect all unique agents with event counts
+  const agentMap={};
+  for(const e of events){
+    const aid=agentIdFor(e);
+    if(!aid)continue;
+    if(!agentMap[aid])agentMap[aid]={count:0,lastTs:''};
+    agentMap[aid].count++;
+    const ts=e.timestamp??e.scannedAt??'';
+    if(ts>agentMap[aid].lastTs)agentMap[aid].lastTs=ts;
+  }
+
+  // Sort: runtime hook first, then by last event time desc
+  const sortedAgents=Object.entries(agentMap).sort((a,b)=>{
+    if(a[0]==='claude-code-hook')return -1;
+    if(b[0]==='claude-code-hook')return 1;
+    return b[1].lastTs.localeCompare(a[1].lastTs);
+  });
+
+  // For runtime hook, check if we need session splitting
+  const rtEntry=sortedAgents.find(([aid])=>aid==='claude-code-hook');
+  if(rtEntry){
+    const rtEvents=events.filter(e=>agentIdFor(e)==='claude-code-hook');
+    const sessions={};
+    for(const e of rtEvents){
+      const sid=sessionIdFor(e)||'default';
+      if(!sessions[sid])sessions[sid]={count:0,lastTs:''};
+      sessions[sid].count++;
+      const ts=e.timestamp??e.scannedAt??'';
+      if(ts>sessions[sid].lastTs)sessions[sid].lastTs=ts;
+    }
+    const sortedSessions=Object.entries(sessions).sort((a,b)=>b[1].lastTs.localeCompare(a[1].lastTs));
+    if(sortedSessions.length<=1){
+      addDynTab(tabsEl,sel,'claude-code-hook','🧩 Runtime Hook ('+rtEntry[1].count+')','Runtime Hook ('+rtEntry[1].count+')');
+    } else {
+      for(const [sid,info] of sortedSessions){
+        const short=sid.length>8?sid.slice(0,8):sid;
+        const filterId='rt:'+sid;
+        addDynTab(tabsEl,sel,filterId,'🧩 '+short+' ('+info.count+')','Runtime · '+short+' ('+info.count+')');
+      }
     }
   }
-  const dynamicAgents=agentIdsForModel(model).filter(id=>!BASE_AGENT_IDS.includes(id));
-  const insertAfter=tabsEl.querySelector('[data-agent="agent-security"]')||tabsEl.lastElementChild;
-  let anchor=insertAfter?.nextSibling||null;
-  for(const id of dynamicAgents){
-    const count=events.filter(e=>agentIdFor(e)===id).length;
-    const btn=document.createElement('button');
-    btn.className='hist-agent-tab'+(historyAgentFilter===id?' active':'');
-    btn.dataset.agent=id;
-    btn.dataset.dynamicAgent='1';
-    btn.textContent=agentIcon(id)+' '+roleForAgentId(id)+(count?' ('+count+')':'');
-    btn.title=agentTitle(id);
-    tabsEl.insertBefore(btn,anchor);
+
+  // Add tabs for non-runtime agents that have events
+  for(const [aid,info] of sortedAgents){
+    if(aid==='claude-code-hook')continue;
+    addDynTab(tabsEl,sel,aid,agentIcon(aid)+' '+agentTitle(aid)+' ('+info.count+')',agentTitle(aid)+' ('+info.count+')');
   }
-  sel.querySelectorAll('option[data-dynamic-agent]').forEach(o=>o.remove());
-  for(const id of dynamicAgents){
-    const count=events.filter(e=>agentIdFor(e)===id).length;
-    const opt=document.createElement('option');
-    opt.value=id;opt.dataset.dynamicAgent='1';
-    opt.textContent=roleForAgentId(id)+(count?' ('+count+')':'');
-    sel.appendChild(opt);
-  }
+}
+
+function addDynTab(tabsEl,sel,agentValue,tabLabel,optLabel){
+  const btn=document.createElement('button');
+  btn.className='hist-agent-tab'+(historyAgentFilter===agentValue?' active':'');
+  btn.dataset.agent=agentValue;
+  btn.dataset.dynamic='1';
+  tabsEl.appendChild(btn);
+  btn.textContent=tabLabel;
+  const opt=document.createElement('option');
+  opt.value=agentValue;opt.dataset.dynamic='1';
+  opt.textContent=optLabel;
+  sel.appendChild(opt);
 }
 
 function filterEventsByAgent(events,fa){
@@ -1881,7 +1861,7 @@ function renderHistory(model){
   const fa=document.getElementById('f-agent').value||historyAgentFilter;
   const now=Date.now();
 
-  buildRuntimeSessionTabs(events,model);
+  buildDynamicAgentTabs(events);
   if(fa)document.getElementById('f-agent').value=fa;
 
   const preFiltered=events.filter(e=>(!fd||e.decision===fd)&&(!fs||surf(e)===fs));
@@ -1890,11 +1870,21 @@ function renderHistory(model){
   if(!fa){
     renderAgentSummaryHeader('',events);
     document.getElementById('hist-count').textContent='Total '+preFiltered.length;
-    const agents=agentIdsForModel(model);
-    const unassigned=preFiltered.filter(e=>!agents.includes(agentIdFor(e)));
-    let html='<div class="hist-agent-grid">'+
-      agents.map(aid=>renderAgentColumn(aid,preFiltered,now,20)).join('')+
-    '</div>';
+    // Dynamically collect agents that have events
+    const agentSet=new Set();
+    for(const e of preFiltered){const aid=agentIdFor(e);if(aid)agentSet.add(aid);}
+    const agents=[...agentSet].sort((a,b)=>{
+      if(a==='claude-code-hook')return -1;
+      if(b==='claude-code-hook')return 1;
+      return a.localeCompare(b);
+    });
+    const unassigned=preFiltered.filter(e=>!agentIdFor(e));
+    let html='';
+    if(agents.length){
+      html='<div class="hist-agent-grid">'+
+        agents.map(aid=>renderAgentColumn(aid,preFiltered,now,20)).join('')+
+      '</div>';
+    }
     if(unassigned.length){
       html+='<div style="margin-top:16px;"><div class="tl-group-header"><span>Unassigned Events</span><span>'+unassigned.length+'</span></div>';
       html+=unassigned.map(e=>renderEventRow(e,now)).join('');
@@ -1956,7 +1946,7 @@ async function loadImageGallery(){
             '<div class="ig-info">'+
               '<div class="ig-verdict unscanned">⏳ 미분석 이미지</div>'+
               '<div style="font-size:11px;color:var(--muted);">아직 보안 스캔이 수행되지 않았습니다.</div>'+
-              '<button class="ig-scan-btn" onclick="scanExistingImage(this,\''+h(img.imageId)+'\')">스캔 시작</button>'+
+              '<button class="ig-scan-btn" onclick="scanExistingImage(this,\\x27'+h(img.imageId)+'\\x27)">스캔 시작</button>'+
             '</div>'+
           '</div></div>';
       }
@@ -2032,7 +2022,7 @@ function renderForensics(model){
       const oBoxes=(item.objects||[]).map(o=>'<div class="bbox obj" style="left:'+((o.x||0)*100)+'%;top:'+((o.y||0)*100)+'%;width:'+((o.width||.1)*100)+'%;height:'+((o.height||.1)*100)+'%;"><span class="bbox-lbl">'+h(o.label||'object')+'</span></div>').join('');
       const injHtml=item.hiddenPrompts?.length?'<div class="inj-banner"><div class="inj-banner-ttl">Hidden Prompts ('+item.hiddenPrompts.length+' found)</div>'+item.hiddenPrompts.map(p=>'<div class="inj-item"><code>'+h(p)+'</code></div>').join('')+'</div>':'';
       const fHtml=item.findings.map(f=>'<div class="finding-row">'+sevPill(f.severity)+'<strong>'+h(f.id)+'</strong><span style="color:var(--muted);">'+h(f.rationale||'')+'</span></div>').join('');
-      return '<div class="img-card"><div class="img-card-hd"><div style="display:flex;align-items:center;gap:8px;">'+bdg('image')+'<strong>'+h(item.imageId||item.eventId||'Image Event')+'</strong></div><div style="display:flex;align-items:center;gap:8px;"><span class="pill '+item.decision+'">'+ST_LABEL[item.decision]+'</span><span style="font-size:11px;color:var(--muted);">'+fmtFull(item.timestamp)+'</span></div></div><div class="img-card-bd">'+(iSrc?'<div class="img-frame"><img src="'+h(iSrc)+'" alt="Evidence image" onerror="this.style.display=\\'none\\';this.nextElementSibling.style.display=\\'block\\'"><div class="img-missing">Image file unavailable — showing extracted text</div>'+rBoxes+oBoxes+'</div>':'<div class="img-frame"><div class="img-missing" style="display:block;">No image path</div></div>')+'<div class="img-info">'+injHtml+(item.extractedText?'<div><span class="lbl-sm">Extracted Text</span><div class="ocr"><code>'+h(item.extractedText)+'</code></div></div>':'')+(fHtml?'<div><span class="lbl-sm">Findings</span><div class="finding-list">'+fHtml+'</div></div>':'')+'<div style="font-size:11px;color:var(--muted);">Hash: <code>'+h((item.imageHash||'').slice(0,16))+'</code> · Confidence: '+h(item.confidence??'n/a')+'</div></div></div></div>';
+      return '<div class="img-card"><div class="img-card-hd"><div style="display:flex;align-items:center;gap:8px;">'+bdg('image')+'<strong>'+h(item.imageId||item.eventId||'Image Event')+'</strong></div><div style="display:flex;align-items:center;gap:8px;"><span class="pill '+item.decision+'">'+ST_LABEL[item.decision]+'</span><span style="font-size:11px;color:var(--muted);">'+fmtFull(item.timestamp)+'</span></div></div><div class="img-card-bd">'+(iSrc?'<div class="img-frame"><img src="'+h(iSrc)+'" alt="Evidence image" onerror="this.style.display=\\x27none\\x27;this.nextElementSibling.style.display=\\x27block\\x27"><div class="img-missing">Image file unavailable — showing extracted text</div>'+rBoxes+oBoxes+'</div>':'<div class="img-frame"><div class="img-missing" style="display:block;">No image path</div></div>')+'<div class="img-info">'+injHtml+(item.extractedText?'<div><span class="lbl-sm">Extracted Text</span><div class="ocr"><code>'+h(item.extractedText)+'</code></div></div>':'')+(fHtml?'<div><span class="lbl-sm">Findings</span><div class="finding-list">'+fHtml+'</div></div>':'')+'<div style="font-size:11px;color:var(--muted);">Hash: <code>'+h((item.imageHash||'').slice(0,16))+'</code> · Confidence: '+h(item.confidence??'n/a')+'</div></div></div></div>';
     }).join('');
   } else {
     html+='<div class="panel"><div class="panel-bd" style="padding:16px;"><div class="empty">아직 이미지 분석 이벤트가 없습니다. 에이전트로 들어온 이미지가 감지되면 여기에 표시됩니다.</div></div></div>';
