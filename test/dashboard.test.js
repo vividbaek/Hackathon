@@ -95,6 +95,8 @@ test('maps OS PID agent metadata into dashboard agent columns', () => {
           source: 'agent:backend:os',
           meta: {
             operation: 'exec',
+            argv: ['grep'],
+            executable: 'grep',
             pid: 456,
             agent: 'backend'
           }
@@ -108,8 +110,17 @@ test('maps OS PID agent metadata into dashboard agent columns', () => {
 
   const qa = model.agentStats.find((agent) => agent.agentId === 'agent-qa');
   const backend = model.agentStats.find((agent) => agent.agentId === 'agent-backend');
+  const qaFlow = model.agentFlows.find((flow) => flow.agentId === 'agent-qa');
+  const backendFlow = model.agentFlows.find((flow) => flow.agentId === 'agent-backend');
   assert.equal(qa.total, 1);
   assert.equal(qa.block, 1);
   assert.equal(backend.total, 1);
   assert.equal(backend.allow, 1);
+  assert.equal(qaFlow.overallDecision, 'block');
+  assert.equal(qaFlow.tasks[0].operation, 'open .env');
+  assert.equal(qaFlow.tasks[0].layer, 'OS Guard');
+  assert.equal(qaFlow.tasks[0].ruleId, 'os-sensitive-file-open');
+  assert.equal(qaFlow.tasks[0].pid, 123);
+  assert.equal(backendFlow.tasks[0].operation, 'grep');
+  assert.equal(backendFlow.tasks[0].decision, 'allow');
 });
