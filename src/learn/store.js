@@ -12,6 +12,7 @@ export function learnPaths(config = {}) {
     shadowEvents: join(dataDir, 'shadow-events.jsonl'),
     approvedRules: config.learn?.approvedRulesPath ?? join(dataDir, 'approved-rules.json'),
     rejectedRules: join(dataDir, 'rejected-rules.json'),
+    learnState: join(dataDir, 'learn-state.json'),
     samples: join(dataDir, 'learn-samples.json'),
     ruleCandidates: join(dataDir, 'rule-candidates.json')
   };

@@ -23,7 +23,8 @@
     "dashboard": "node src/dashboard.js",
     "agents": "node scripts/run-agents.js",
     "bench": "node scripts/benchmark.js",
-    "self-loop": "node scripts/self-loop.js"
+    "self-loop": "node scripts/self-loop.js",
+    "self-loop:watch": "node scripts/self-loop-watch.js"
   },
   "engines": {
     "node": ">=20"
