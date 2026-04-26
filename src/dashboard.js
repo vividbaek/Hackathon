@@ -1,7 +1,13 @@
 #!/usr/bin/env node
 import { createServer } from 'node:http';
-import { readFile } from 'node:fs/promises';
+import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import { extname, join, resolve, sep } from 'node:path';
+import { loadConfig } from './config.js';
+import { createVisionProviderFromConfig } from './providers/vision-llm.js';
+import { scanText, mergeReports } from './policy/engine.js';
+import { highestSeverity } from './policy/severity.js';
+import { recordReport } from './guard.js';
+import { preprocessImage } from './image-preprocess.js';
 
 const DEFAULT_PORT = 4040;
 const MAX_PORT = 4050;
@@ -94,7 +100,7 @@ function normalizeDashboardAgentId(value) {
 
 function agentFromSource(source) {
   const match = String(source ?? '').match(/^agent:([^:]+):os$/);
-  return match ? match[1] : '';
+  return match ? match[1] : null;
 }
 
 function dashboardAgentId(e) {
@@ -273,6 +279,39 @@ function summarizeSurfaces(events) {
   return c;
 }
 
+const FIVE_LAYERS = [
+  { id: 'prompt', label: 'Prompt Guard', icon: '📝', surfaces: ['prompt'] },
+  { id: 'shell',  label: 'Shell Guard',  icon: '⚡', surfaces: ['command'] },
+  { id: 'es',     label: 'ES Guard',     icon: '🔒', surfaces: ['os'] },
+  { id: 'output', label: 'Output Guard', icon: '📤', surfaces: ['output'] },
+  { id: 'screen', label: 'Screen Watch', icon: '🖼', surfaces: ['image', 'vision_observation'] }
+];
+
+function buildLayerOverview(events, candidates) {
+  return FIVE_LAYERS.map(layer => {
+    const layerEvents = events.filter(e => layer.surfaces.includes(eventType(e)));
+    const block = layerEvents.filter(e => e.decision === 'block').length;
+    const warn = layerEvents.filter(e => e.decision === 'warn').length;
+    const ruleSet = new Set();
+    for (const e of layerEvents) {
+      for (const f of e.findings ?? []) { if (f.id) ruleSet.add(f.id); }
+    }
+    const layerCandidates = candidates.filter(c => {
+      const cSurface = c.rule?.surface ?? c.surface ?? '';
+      return layer.surfaces.includes(cSurface);
+    });
+    return {
+      ...layer,
+      total: layerEvents.length,
+      block,
+      warn,
+      topRule: ruleSet.size > 0 ? [...ruleSet][0] : null,
+      ruleCount: ruleSet.size,
+      candidateCount: layerCandidates.length
+    };
+  });
+}
+
 function collectTimeline(events, candidates) {
   const eventItems = events.map((event) => ({
     kind: 'event',
@@ -419,7 +458,8 @@ export function buildDashboardModel({ events = [], candidates = [], state = {} }
     candidates: candidateList.slice(0, 8),
     timeline: collectTimeline(recentEvents, candidateList),
     events: recentEvents.slice(-100).reverse(),
-    surfaceCounts: summarizeSurfaces(recentEvents)
+    surfaceCounts: summarizeSurfaces(recentEvents),
+    layerOverview: buildLayerOverview(recentEvents, candidateList)
   };
 }
 
@@ -457,7 +497,62 @@ async function sendEvidenceImage(res, p) {
   res.end(body);
 }
 
+const MAX_UPLOAD_SIZE = 10 * 1024 * 1024;
+const ALLOWED_IMAGE_TYPES = { '.png':'image/png', '.jpg':'image/jpeg', '.jpeg':'image/jpeg', '.gif':'image/gif', '.webp':'image/webp' };
+
+async function readRawBody(req, maxSize = MAX_UPLOAD_SIZE) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > maxSize) throw new Error(`파일이 너무 큽니다. 최대 ${maxSize / 1024 / 1024}MB까지 가능합니다.`);
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+function parseMultipartFormData(contentType, body) {
+  const match = contentType.match(/boundary=(?:"([^"]+)"|([^\s;]+))/);
+  if (!match) throw new Error('Missing multipart boundary.');
+  const boundary = match[1] || match[2];
+  const boundaryBuf = Buffer.from(`--${boundary}`);
+  const parts = [];
+  let start = body.indexOf(boundaryBuf);
+  if (start === -1) throw new Error('No multipart boundary found in body.');
+  while (true) {
+    start += boundaryBuf.length;
+    if (body[start] === 0x2D && body[start + 1] === 0x2D) break;
+    start += 2;
+    const headerEnd = body.indexOf(Buffer.from('\r\n\r\n'), start);
+    if (headerEnd === -1) break;
+    const headerStr = body.subarray(start, headerEnd).toString('utf8');
+    const dataStart = headerEnd + 4;
+    const nextBoundary = body.indexOf(boundaryBuf, dataStart);
+    if (nextBoundary === -1) break;
+    const data = body.subarray(dataStart, nextBoundary - 2);
+    const headers = {};
+    for (const line of headerStr.split('\r\n')) {
+      const ci = line.indexOf(':');
+      if (ci > 0) headers[line.slice(0, ci).toLowerCase().trim()] = line.slice(ci + 1).trim();
+    }
+    const disposition = headers['content-disposition'] || '';
+    const nameMatch = disposition.match(/name="([^"]+)"/);
+    const filenameMatch = disposition.match(/filename="([^"]+)"/);
+    parts.push({ name: nameMatch?.[1] ?? '', filename: filenameMatch?.[1] ?? null, contentType: headers['content-type'] ?? 'application/octet-stream', data });
+    start = nextBoundary;
+  }
+  return parts;
+}
+
+function sendJsonError(res, status, msg) {
+  res.writeHead(status, { 'content-type':'application/json; charset=utf-8' });
+  res.end(JSON.stringify({ error: msg }));
+}
+
 export function createDashboardServer({ dataDir = '.404gent' } = {}) {
+  let _config = null;
+  async function getConfig() { if (!_config) _config = await loadConfig(); return _config; }
+
   return createServer(async (req, res) => {
     try {
       const url = new URL(req.url, 'http://localhost');
@@ -474,6 +569,81 @@ export function createDashboardServer({ dataDir = '.404gent' } = {}) {
       }
       if (url.pathname === '/api/status') { sendJson(res, await readDashboardModel({ dataDir })); return; }
       if (url.pathname === '/api/image') { await sendEvidenceImage(res, url.searchParams.get('path')); return; }
+
+      // ── Image Upload Scan ─────────────────────────────────────────────────
+      if (req.method === 'POST' && url.pathname === '/api/scan-image') {
+        const ct = req.headers['content-type'] || '';
+        if (!ct.includes('multipart/form-data')) { sendJsonError(res, 400, 'Expected multipart/form-data'); return; }
+        const rawBody = await readRawBody(req);
+        const parts = parseMultipartFormData(ct, rawBody);
+        const filePart = parts.find(p => p.name === 'image' && p.filename);
+        if (!filePart) { sendJsonError(res, 400, 'No image file found. Use field name "image".'); return; }
+        const ext = (filePart.filename.match(/\.[^.]+$/) || ['.bin'])[0].toLowerCase();
+        const mediaType = ALLOWED_IMAGE_TYPES[ext];
+        if (!mediaType) { sendJsonError(res, 400, `지원하지 않는 이미지: ${ext}. PNG, JPG, GIF, WebP만 가능합니다.`); return; }
+
+        const uploadDir = join(dataDir, 'uploads');
+        await mkdir(uploadDir, { recursive: true });
+        const safeFilename = filePart.filename.replace(/[^a-zA-Z0-9._-]/g, '_');
+        const savedPath = join(uploadDir, `${Date.now()}-${safeFilename}`);
+        await writeFile(savedPath, filePart.data);
+
+        const config = await getConfig();
+
+        // 1) OCR 멀티패스 (Tesseract: 극한대비, CLAHE, 엣지, 임계값) → 숨겨진 텍스트 추출
+        let ocrHiddenTexts = [];
+        let ocrAllTexts = [];
+        let preprocessResult = null;
+        try {
+          preprocessResult = await preprocessImage(savedPath, config, { quiet: true });
+          const detections = preprocessResult.preprocessed?.detections ?? [];
+          ocrHiddenTexts = detections.filter(d => d.kind === 'hidden_text').map(d => d.text);
+          ocrAllTexts = detections.map(d => d.text);
+        } catch (ocrErr) {
+          console.error('OCR preprocessing failed (continuing with Vision API):', ocrErr.message);
+        }
+
+        // 2) Vision API (Claude) → 이미지 직접 분석
+        const visionProvider = createVisionProviderFromConfig(config);
+        const base64 = filePart.data.toString('base64');
+        const visionResult = await visionProvider.analyzeImage({ base64, mediaType });
+
+        // 3) 모든 소스에서 추출된 텍스트 결합 (공백+줄바꿈 양쪽으로 결합하여 패턴 매칭 향상)
+        const ocrHiddenSentence = ocrHiddenTexts.join(' ');
+        const ocrAllSentence = ocrAllTexts.join(' ');
+        const scanInput = [
+          ...visionResult.hiddenPrompts,
+          ...(visionResult.regions ?? []).map(r => r.text).filter(Boolean),
+          ocrHiddenSentence,
+          ocrAllSentence
+        ].filter(Boolean).join('\n') || '';
+
+        const allHiddenPrompts = [
+          ...visionResult.hiddenPrompts,
+          ...(ocrHiddenSentence ? [ocrHiddenSentence] : [])
+        ].filter(Boolean);
+
+        // 4) 룰엔진 스캔
+        let result = scanText({ surface: 'image', text: scanInput, config, evidence: {
+          hiddenPrompts: allHiddenPrompts, objects: visionResult.objects,
+          regions: visionResult.regions, imagePath: savedPath,
+          ocrDetections: preprocessResult?.preprocessed?.detections,
+          normalizedImagePath: preprocessResult?.normalizedPath
+        }});
+
+        // 5) Vision 결과 병합
+        if (!visionResult.skipped) {
+          const merged = mergeReports(result, visionResult, config);
+          result = { ...merged, surface: 'image', text: scanInput,
+            severity: merged.findings.length > 0 ? highestSeverity(merged.findings) : 'low',
+            scannedAt: result.scannedAt };
+        }
+
+        await recordReport(result, config);
+        sendJson(res, result);
+        return;
+      }
+
       if (url.pathname === '/' || url.pathname === '/dashboard') { sendHtml(res); return; }
       res.writeHead(404); res.end('Not found');
     } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: e.message })); }
@@ -505,7 +675,7 @@ function renderHtml() {
   --bg:#f0f2f7;--panel:#fff;--ink:#111827;--muted:#6b7280;--border:#e5e7eb;
   --hdr:#0f172a;--hdr-border:#1e293b;
   --allow:#059669;--warn:#d97706;--block:#dc2626;--idle:#94a3b8;--inject:#7c3aed;--accent:#4f46e5;
-  --c-image:#7c3aed;--c-prompt:#2563eb;--c-command:#d97706;--c-output:#059669;--c-llm:#0891b2;--c-vision_observation:#7c3aed;
+  --c-image:#7c3aed;--c-prompt:#2563eb;--c-command:#d97706;--c-os:#e11d48;--c-output:#059669;--c-llm:#0891b2;--c-vision_observation:#7c3aed;
   --r:10px;
 }
 *{box-sizing:border-box;margin:0;padding:0;}
@@ -607,6 +777,7 @@ svg.graph{display:block;width:100%;min-width:960px;height:310px;}
 .badge-command{background:#fef3c7;color:#92400e;}
 .badge-output{background:#d1fae5;color:#065f46;}
 .badge-llm{background:#cffafe;color:#0e7490;}
+.badge-os{background:#ffe4e6;color:#9f1239;}
 .badge-unknown{background:#f3f4f6;color:#6b7280;}
 .badge-agent{background:#fce7f3;color:#9d174d;}
 
@@ -1012,8 +1183,10 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
         <select id="f-surf">
           <option value="">All</option>
           <option value="image">image</option>
+          <option value="vision_observation">vision_observation</option>
           <option value="prompt">prompt</option>
           <option value="command">command</option>
+          <option value="os">os</option>
           <option value="output">output</option>
           <option value="llm">llm</option>
         </select>
@@ -1036,7 +1209,27 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
 
 <!-- Image Forensics -->
 <div class="tab-panel" id="panel-forensics">
-  <div class="foren-wrap" id="foren-content"></div>
+  <div class="foren-wrap">
+    <div class="panel" id="upload-panel">
+      <div class="panel-hd"><h2>이미지 업로드 스캔</h2><span style="font-size:11px;color:var(--muted);">PNG, JPG, GIF, WebP (최대 10MB)</span></div>
+      <div class="panel-bd" style="padding:16px;">
+        <div id="drop-zone">
+          <div style="font-size:36px;margin-bottom:8px;">📂</div>
+          <div style="font-size:13px;font-weight:600;color:var(--ink);">이미지를 드래그하거나 클릭하여 업로드</div>
+          <div style="font-size:11px;color:var(--muted);margin-top:4px;">Vision AI + 룰 엔진으로 보안 위협을 자동 탐지합니다</div>
+          <input type="file" id="file-input" accept="image/png,image/jpeg,image/gif,image/webp" style="display:none;">
+        </div>
+        <div id="upload-status" style="margin-top:12px;display:none;">
+          <div id="upload-progress" style="display:flex;align-items:center;gap:10px;padding:10px;background:#f8fafc;border-radius:8px;">
+            <span class="upload-spinner"></span>
+            <span id="upload-msg" style="font-size:12px;color:var(--muted);">이미지 분석 중...</span>
+          </div>
+        </div>
+        <div id="upload-result" style="margin-top:12px;display:none;"></div>
+      </div>
+    </div>
+    <div id="foren-content"></div>
+  </div>
 </div>
 
 <!-- Rule Engine -->
@@ -1136,9 +1329,9 @@ const STAGE_META={
   output:            {icon:'📤', label:'Output Inspection'}
 };
 function renderAgentFlows(model){
-  const flows=model.agentFlows||[];
+  const flows=(model.agentFlows||[]).filter(f=>f.eventCount>0);
   const stats=model.agentStats||[];
-  if(!flows.length){return;}
+  if(!flows.length){document.getElementById('agent-flows').innerHTML='<div class="afc-empty" style="padding:32px;font-size:13px;color:var(--muted);">실행 중인 에이전트가 없습니다.</div>';return;}
   document.getElementById('agent-flows').innerHTML=flows.map(flow=>{
     const m=ROLE_META[flow.role]||{label:flow.role,icon:'🤖',sub:''};
     const od=flow.overallDecision||'idle';
@@ -1168,7 +1361,7 @@ function renderAgentFlows(model){
     return '<div class="afc-col '+od+'" data-agent-id="'+flow.agentId+'">'+
       '<div class="afc-header">'+
         '<span class="afc-icon">'+m.icon+'</span>'+
-        '<div><div class="afc-name">'+h(m.label)+sessionBadge+'</div><div class="afc-sub">'+h(m.sub)+'</div>'+(miniStats?'<div class="afc-mini-stats">'+miniStats+'</div>':'')+'</div>'+
+        '<div><div class="afc-name">'+label+recentDot+'</div><div class="afc-sub">'+sub+'</div>'+(miniStats?'<div class="afc-mini-stats">'+miniStats+'</div>':'')+'</div>'+
         '<span class="afc-status pill '+od+'">'+ST_LABEL[od]+'</span>'+
       '</div>'+
       '<div class="afc-pipeline">'+(tasksHtml||'<div class="afc-empty" style="padding:20px;font-size:12px;">No task logs</div>')+'</div>'+
@@ -1283,10 +1476,7 @@ function renderEventRow(e,now){
   return '<div class="tl-row '+d+(recent?' recent':'')+'"><div class="tl-head"><span class="tl-ts">'+fmt(e.timestamp??e.recordedAt)+'</span><span class="tl-dec '+d+'">'+ST_LABEL[d]+'</span>'+sevBdg+bdg(s)+agentBdg+'<span class="tl-txt"><code>'+h(txt)+'</code></span><span class="tl-cnt">found '+findings.length+'</span></div><div class="tl-detail"><div class="tl-detail-hd"><strong>Event ID:</strong> '+h(e.id||'—')+' · <strong>Agent:</strong> '+h(aid||'—')+' · <strong>Time:</strong> '+fmtFull(e.timestamp)+(e.event?.evidence?.imagePath?' · <strong>Image:</strong> '+h(e.event.evidence.imagePath):'')+'</div>'+(fRows?'<div class="finding-list">'+fRows+'</div>':'')+injSec+'</div></div>';
 }
 
-function renderAgentColumn(agentId,events,now,maxRows){
-  const role=agentId==='claude-code-hook'?'runtime':agentId.replace('agent-','');
-  const m=ROLE_META[role]||{icon:'🤖',label:agentId,sub:''};
-  const ae=events.filter(e=>agentIdFor(e)===agentId);
+function renderAgentColumnInner(label,sub,icon,ae,now,maxRows){
   const bk=ae.filter(e=>e.decision==='block').length;
   const wn=ae.filter(e=>e.decision==='warn').length;
   const al=ae.filter(e=>e.decision==='allow').length;
@@ -1316,16 +1506,98 @@ function renderAgentColumn(agentId,events,now,maxRows){
     ?'<div class="hac-footer"><button onclick="document.querySelectorAll(\\'[data-agent=&quot;'+agentId+'&quot;]\\').forEach(b=>b.click())">+'+( ae.length-shown.length)+' more</button></div>':'';
   return '<div class="hist-agent-col '+borderCls+'">'+
     '<div class="hac-header">'+
-      '<span class="hac-icon">'+m.icon+'</span>'+
-      '<div class="hac-info"><div class="hac-name">'+h(m.label)+'</div><div class="hac-sub">'+h(m.sub)+'</div></div>'+
+      '<span class="hac-icon">'+icon+'</span>'+
+      '<div class="hac-info"><div class="hac-name">'+h(label)+'</div><div class="hac-sub">'+h(sub)+'</div></div>'+
       '<div class="hac-stats">'+
         (bk?'<div class="hac-stat block"><span class="hac-stat-n">'+bk+'</span>Blocked</div>':'')+
         (wn?'<div class="hac-stat warn"><span class="hac-stat-n">'+wn+'</span>Warning</div>':'')+
         '<div class="hac-stat allow"><span class="hac-stat-n">'+al+'</span>Allowed</div>'+
       '</div>'+
     '</div>'+
-    '<div class="hac-body">'+rowsHtml+'</div>'+moreBtn+
+    '<div class="hac-body">'+rowsHtml+'</div>'+
   '</div>';
+}
+
+function renderAgentColumn(agentId,events,now,maxRows){
+  const role=agentId==='claude-code-hook'?'runtime':agentId.replace('agent-','');
+  const m=ROLE_META[role]||{icon:'🤖',label:agentId,sub:''};
+  const ae=events.filter(e=>agentIdFor(e)===agentId);
+  return renderAgentColumnInner(m.label,m.sub,m.icon,ae,now,maxRows);
+}
+
+function renderAgentColumnForSession(agentId,sessionEvents,now,maxRows,shortSid){
+  const m=ROLE_META.runtime;
+  const label=m.label+' · '+shortSid;
+  return renderAgentColumnInner(label,'세션 '+shortSid,m.icon,sessionEvents,now,maxRows);
+}
+
+function sessionIdFor(e){return e.event?.meta?.sessionId??'';}
+
+function buildRuntimeSessionTabs(events){
+  const tabsEl=document.getElementById('hist-agent-tabs');
+  // Remove old dynamic runtime tabs
+  tabsEl.querySelectorAll('.hist-agent-tab[data-rt-session]').forEach(b=>b.remove());
+  // Collect runtime sessions
+  const rtEvents=events.filter(e=>agentIdFor(e)==='claude-code-hook');
+  const sessions={};
+  for(const e of rtEvents){
+    const sid=sessionIdFor(e)||'default';
+    if(!sessions[sid])sessions[sid]={count:0,lastTs:''};
+    sessions[sid].count++;
+    const ts=e.timestamp??e.scannedAt??'';
+    if(ts>sessions[sid].lastTs)sessions[sid].lastTs=ts;
+  }
+  const sorted=Object.entries(sessions).sort((a,b)=>b[1].lastTs.localeCompare(a[1].lastTs));
+  // Insert runtime session tabs after "전체" button
+  const allBtn=tabsEl.querySelector('[data-agent=""]');
+  const qaBtn=tabsEl.querySelector('[data-agent="agent-qa"]');
+  if(sorted.length<=1){
+    // Single or no session: show classic single tab
+    const btn=document.createElement('button');
+    btn.className='hist-agent-tab'+(historyAgentFilter==='claude-code-hook'?' active':'');
+    btn.dataset.agent='claude-code-hook';
+    btn.dataset.rtSession='1';
+    btn.textContent='🧩 Runtime Hook'+(sorted.length?(' ('+sorted[0][1].count+')'):'');
+    tabsEl.insertBefore(btn,qaBtn);
+  } else {
+    for(const [sid,info] of sorted){
+      const short=sid.length>8?sid.slice(0,8):sid;
+      const filterId='rt:'+sid;
+      const btn=document.createElement('button');
+      btn.className='hist-agent-tab'+(historyAgentFilter===filterId?' active':'');
+      btn.dataset.agent=filterId;
+      btn.dataset.rtSession='1';
+      btn.textContent='🧩 '+short+' ('+info.count+')';
+      btn.title='Runtime Hook · 세션 '+sid;
+      tabsEl.insertBefore(btn,qaBtn);
+    }
+  }
+  // Also update the f-agent dropdown
+  const sel=document.getElementById('f-agent');
+  sel.querySelectorAll('option[data-rt-session]').forEach(o=>o.remove());
+  const qaOpt=sel.querySelector('option[value="agent-qa"]');
+  if(sorted.length<=1){
+    const opt=document.createElement('option');
+    opt.value='claude-code-hook';opt.dataset.rtSession='1';
+    opt.textContent='Runtime Hook'+(sorted.length?(' ('+sorted[0][1].count+')'):'');
+    sel.insertBefore(opt,qaOpt);
+  } else {
+    for(const [sid,info] of sorted){
+      const short=sid.length>8?sid.slice(0,8):sid;
+      const opt=document.createElement('option');
+      opt.value='rt:'+sid;opt.dataset.rtSession='1';
+      opt.textContent='Runtime · '+short+' ('+info.count+')';
+      sel.insertBefore(opt,qaOpt);
+    }
+  }
+}
+
+function filterEventsByAgent(events,fa){
+  if(fa.startsWith('rt:')){
+    const sid=fa.slice(3);
+    return events.filter(e=>agentIdFor(e)==='claude-code-hook'&&sessionIdFor(e)===sid);
+  }
+  return events.filter(e=>agentIdFor(e)===fa);
 }
 
 function renderHistory(model){
@@ -1334,6 +1606,8 @@ function renderHistory(model){
   const fs=document.getElementById('f-surf').value;
   const fa=document.getElementById('f-agent').value||historyAgentFilter;
   const now=Date.now();
+
+  buildRuntimeSessionTabs(events);
 
   const preFiltered=events.filter(e=>(!fd||e.decision===fd)&&(!fs||surf(e)===fs));
 
@@ -1550,6 +1824,7 @@ function renderAll(model){
   renderMetrics(model.counts,model.safetyScore);
   if(activeTab==='overview'){
     renderActionBanner(model);
+    renderLayerOverview(model);
     renderAgentFlows(model);
     renderVisionFlow(model);
     renderDiscoveries(model.hiddenPromptDiscoveries||[]);
@@ -1568,13 +1843,99 @@ function renderAll(model){
 // ── SSE connection ───────────────────────────────────────────────────────────
 const sse=new EventSource('/api/events');
 sse.onmessage=e=>{
-  try{renderAll(JSON.parse(e.data));}catch{}
+  try{
+    const data=JSON.parse(e.data);
+    if(data.error){
+      document.getElementById('updated').textContent='오류: '+data.error.slice(0,60);
+      return;
+    }
+    renderAll(data);
+  }catch(err){
+    document.getElementById('updated').textContent='렌더 오류: '+String(err).slice(0,60);
+  }
 };
 sse.onopen=()=>{ document.getElementById('live-dot').className='dot live'; };
 sse.onerror=()=>{
   document.getElementById('live-dot').className='dot err';
   document.getElementById('updated').textContent='Reconnecting...';
 };
+
+// ── Image Upload ──────────────────────────────────────────────────────────────
+(function(){
+  const dropZone=document.getElementById('drop-zone');
+  const fileInput=document.getElementById('file-input');
+  const statusEl=document.getElementById('upload-status');
+  const progressEl=document.getElementById('upload-progress');
+  const msgEl=document.getElementById('upload-msg');
+  const resultEl=document.getElementById('upload-result');
+  if(!dropZone)return;
+
+  dropZone.addEventListener('click',()=>fileInput.click());
+  fileInput.addEventListener('change',()=>{if(fileInput.files.length>0)uploadFile(fileInput.files[0]);});
+  dropZone.addEventListener('dragover',e=>{e.preventDefault();dropZone.classList.add('dragover');});
+  dropZone.addEventListener('dragleave',()=>dropZone.classList.remove('dragover'));
+  dropZone.addEventListener('drop',e=>{e.preventDefault();dropZone.classList.remove('dragover');const f=e.dataTransfer.files[0];if(f)uploadFile(f);});
+
+  async function uploadFile(file){
+    const ALLOWED=['image/png','image/jpeg','image/gif','image/webp'];
+    if(!ALLOWED.includes(file.type)){alert('지원하지 않는 파일 형식입니다. PNG, JPG, GIF, WebP만 가능합니다.');return;}
+    if(file.size>10*1024*1024){alert('파일이 너무 큽니다. 최대 10MB까지 가능합니다.');return;}
+
+    dropZone.classList.add('uploading');
+    statusEl.style.display='block';
+    progressEl.style.display='flex';
+    msgEl.textContent='이미지 업로드 중... ('+(file.size/1024).toFixed(0)+' KB)';
+    resultEl.style.display='none';
+
+    try{
+      const fd=new FormData();
+      fd.append('image',file);
+      msgEl.textContent='Vision AI 분석 중... (최대 30초 소요)';
+
+      const resp=await fetch('/api/scan-image',{method:'POST',body:fd});
+      const data=await resp.json();
+      if(!resp.ok)throw new Error(data.error||'Upload failed');
+
+      progressEl.style.display='none';
+      resultEl.style.display='block';
+      const d=data.decision||'allow';
+      const findings=data.findings||[];
+      const hPrompts=data.event?.evidence?.hiddenPrompts||[];
+
+      let html='<div class="upload-result-card '+d+'">';
+      html+='<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">';
+      html+='<span class="pill '+d+'">'+ST_LABEL[d]+'</span>';
+      html+='<strong>'+h(file.name)+'</strong>';
+      if(data.severity)html+=sevPill(data.severity);
+      html+='</div>';
+
+      if(hPrompts.length){
+        html+='<div style="margin-bottom:8px;padding:8px;background:#f5f3ff;border:1px solid #ddd6fe;border-radius:6px;">';
+        html+='<strong style="color:#7c3aed;font-size:10px;text-transform:uppercase;">숨겨진 프롬프트 '+hPrompts.length+'건</strong>';
+        hPrompts.forEach(p=>{html+='<div style="margin-top:4px;"><code style="color:#7c3aed;font-size:11px;">'+h(p)+'</code></div>';});
+        html+='</div>';
+      }
+
+      if(findings.length){
+        html+='<div style="display:flex;flex-direction:column;gap:4px;">';
+        findings.forEach(f=>{html+='<div style="display:flex;align-items:center;gap:6px;font-size:12px;">'+sevPill(f.severity)+'<strong>'+h(f.id)+'</strong><span style="color:var(--muted);">'+h(f.rationale||'')+'</span></div>';});
+        html+='</div>';
+      } else {
+        html+='<div style="font-size:12px;color:var(--muted);">위협이 감지되지 않았습니다.</div>';
+      }
+
+      html+='</div>';
+      resultEl.innerHTML=html;
+    }catch(err){
+      progressEl.style.display='none';
+      resultEl.style.display='block';
+      resultEl.innerHTML='<div style="padding:10px;background:#fef2f2;border:1px solid var(--block);border-radius:6px;font-size:12px;color:var(--block);">오류: '+h(err.message)+'</div>';
+    }finally{
+      dropZone.classList.remove('uploading');
+      fileInput.value='';
+    }
+  }
+})();
 </script>
 </body>
 </html>`;
