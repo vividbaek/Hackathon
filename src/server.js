@@ -59,6 +59,10 @@ async function sendImage(requestUrl, response, config = {}) {
 export function createPolicyServer({ config } = {}) {
   return createServer(async (request, response) => {
     try {
+      if (/\/images\//.test(request.url) && /%2e/i.test(request.url)) {
+        sendJson(response, 400, { error: 'Image path escapes data directory.' });
+        return;
+      }
       const url = new URL(request.url, `http://${request.headers.host ?? 'localhost'}`);
 
       if (request.method === 'GET' && url.pathname === '/health') {
