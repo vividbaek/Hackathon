@@ -73,6 +73,12 @@ const graphEdges = [
   ['supervisor-agent','policy-agent']
 ];
 
+const RUNTIME_HOOK_AGENT_ID = 'claude-code-hook';
+
+function dashboardAgentId(e) {
+  return e.event?.agentId ?? (e.event?.source === 'claude-code-hook' ? RUNTIME_HOOK_AGENT_ID : '');
+}
+
 const threeAgentRunbook = [
   { id:'agent-vision-sentinel', label:'Agent 1 · Vision Sentinel', icon:'👁',
     objective:'이미지·스크린샷·OCR 결과에서 숨겨진 prompt injection과 의심 영역을 탐지합니다.',
@@ -199,10 +205,10 @@ function computeSafetyScore(events, candidates) {
 }
 
 function computeAgentStats(events) {
-  const ROLES = ['qa', 'backend', 'security'];
+  const ROLES = ['runtime', 'qa', 'backend', 'security'];
   return ROLES.map(role => {
-    const agentId = `agent-${role}`;
-    const agentEvents = events.filter(e => (e.event?.agentId ?? '') === agentId);
+    const agentId = role === 'runtime' ? RUNTIME_HOOK_AGENT_ID : `agent-${role}`;
+    const agentEvents = events.filter(e => dashboardAgentId(e) === agentId);
     const blockEvents = agentEvents.filter(e => e.decision === 'block');
     const ruleFreq = {};
     for (const e of blockEvents) {
@@ -270,13 +276,13 @@ function collectTimeline(events, candidates) {
 }
 
 function buildAgentFlows(events) {
-  const ROLES = ['qa', 'backend', 'security'];
+  const ROLES = ['runtime', 'qa', 'backend', 'security'];
   const STAGE_ORDER = ['image', 'vision_observation', 'prompt', 'llm', 'command', 'output'];
   const RECENT_MS = 5 * 60 * 1000;
   const now = Date.now();
   return ROLES.map(role => {
-    const agentId = `agent-${role}`;
-    const agentEvents = events.filter(e => (e.event?.agentId ?? '') === agentId);
+    const agentId = role === 'runtime' ? RUNTIME_HOOK_AGENT_ID : `agent-${role}`;
+    const agentEvents = events.filter(e => dashboardAgentId(e) === agentId);
     const bySession = {};
     for (const ev of agentEvents) {
       const sid = ev.event?.meta?.sessionId ?? 'default';
@@ -674,7 +680,7 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
 .afc-empty{padding:24px;text-align:center;color:var(--muted);font-size:13px;}
 
 /* 3-에이전트 병렬 그리드 */
-.agent-flows-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;padding:16px;}
+.agent-flows-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;padding:16px;}
 @media(max-width:900px){.agent-flows-grid{grid-template-columns:1fr;}}
 
 /* 에이전트 컬럼 */
@@ -822,7 +828,7 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
 .afc-mini-stats{display:flex;gap:8px;font-size:11px;font-weight:800;margin-top:4px;}
 
 /* ── 히스토리 에이전트 3분할 ── */
-.hist-agent-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;}
+.hist-agent-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px;}
 @media(max-width:1000px){.hist-agent-grid{grid-template-columns:1fr;}}
 .hist-agent-col{background:var(--panel);border:1px solid var(--border);border-radius:var(--r);overflow:hidden;display:flex;flex-direction:column;}
 .hist-agent-col.has-block{border-color:#fca5a5;}
@@ -919,6 +925,7 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
   <div class="hist-wrap">
     <div class="hist-agent-tabs" id="hist-agent-tabs">
       <button class="hist-agent-tab active" data-agent="">전체 타임라인</button>
+      <button class="hist-agent-tab" data-agent="claude-code-hook">🧩 Runtime Hook</button>
       <button class="hist-agent-tab" data-agent="agent-qa">🔍 QA Agent</button>
       <button class="hist-agent-tab" data-agent="agent-backend">⚙️ Backend Agent</button>
       <button class="hist-agent-tab" data-agent="agent-security">🛡 Security Agent</button>
@@ -949,6 +956,7 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
         <label>에이전트</label>
         <select id="f-agent">
           <option value="">전체</option>
+          <option value="claude-code-hook">Runtime Hook</option>
           <option value="agent-qa">QA 에이전트</option>
           <option value="agent-backend">Backend 에이전트</option>
           <option value="agent-security">Security 에이전트</option>
@@ -980,13 +988,14 @@ let seenEventIds = new Set();
 const ST_LABEL = { idle:'대기', allow:'허용', warn:'경고', block:'차단' };
 const ST_EN    = { idle:'IDLE', allow:'ALLOW', warn:'WARN', block:'BLOCK' };
 const SEV_CLS  = { critical:'critical', high:'high', medium:'medium', low:'low' };
-const AGENT_LABEL = {'agent-qa':'QA','agent-backend':'Backend','agent-security':'Security'};
+const AGENT_LABEL = {'claude-code-hook':'Runtime Hook','agent-qa':'QA','agent-backend':'Backend','agent-security':'Security'};
 const SURF_COLORS = {prompt:'#2563eb',command:'#d97706',output:'#059669',llm:'#0891b2',image:'#7c3aed'};
 
 function h(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function fmt(v){return v?new Date(v).toLocaleTimeString('ko-KR',{hour12:false}):'—';}
 function fmtFull(v){return v?new Date(v).toLocaleString('ko-KR',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}):'—';}
 function surf(e){return e.event?.type??e.surface??'unknown';}
+function agentIdFor(e){return e.event?.agentId??(e.event?.source==='claude-code-hook'?'claude-code-hook':'');}
 function bdg(s){return '<span class="badge badge-'+h(s)+'">'+h(s)+'</span>';}
 function sevPill(s){return '<span class="sev '+h(SEV_CLS[s]||'low')+'">'+h(s)+'</span>';}
 
@@ -1044,6 +1053,7 @@ function renderMetrics(c, ss){
 
 // ── LLM 에이전트 3개 병렬 파이프라인 ─────────────────────────────────────────
 const ROLE_META={
+  runtime: {label:'Runtime Hook',       icon:'🧩', sub:'Claude Code hook events'},
   qa:      {label:'Agent 1 · QA',       icon:'🔍', sub:'Frontend / Design QA'},
   backend: {label:'Agent 2 · Backend',   icon:'⚙️',  sub:'Backend / Integration'},
   security:{label:'Agent 3 · Security',  icon:'🛡',  sub:'Security / Analyst'}
@@ -1166,7 +1176,7 @@ function groupByTimeWindow(events,windowMin){
 function renderAgentSummaryHeader(agentId,events){
   const el=document.getElementById('hist-agent-summary');
   if(!agentId){el.style.display='none';return;}
-  const ae=events.filter(e=>(e.event?.agentId??'')===agentId);
+  const ae=events.filter(e=>agentIdFor(e)===agentId);
   const bk=ae.filter(e=>e.decision==='block').length;
   const wn=ae.filter(e=>e.decision==='warn').length;
   const al=ae.filter(e=>e.decision==='allow').length;
@@ -1174,7 +1184,7 @@ function renderAgentSummaryHeader(agentId,events){
   const ruleFreq={};
   for(const e of ae.filter(e=>e.decision==='block')){for(const f of(e.findings??[])){ruleFreq[f.id]=(ruleFreq[f.id]??0)+1;}}
   const topRules=Object.entries(ruleFreq).sort((a,b)=>b[1]-a[1]).slice(0,3);
-  const role=agentId.replace('agent-','');
+  const role=agentId==='claude-code-hook'?'runtime':agentId.replace('agent-','');
   const m=ROLE_META[role]||{icon:'🤖',label:agentId,sub:''};
   el.style.display='flex';
   el.innerHTML='<div class="has-icon">'+m.icon+'</div>'+
@@ -1191,7 +1201,7 @@ function renderAgentSummaryHeader(agentId,events){
 
 function renderEventRow(e,now){
   const d=e.decision||'allow',s=surf(e);
-  const aid=e.event?.agentId??'';
+  const aid=agentIdFor(e);
   const aLbl=AGENT_LABEL[aid]??aid;
   const agentBdg=aid?'<span class="badge badge-agent" title="'+h(aid)+'">'+h(aLbl)+'</span>':'';
   const recent=d==='block'&&(now-Date.parse(e.timestamp??''))<30000;
@@ -1206,9 +1216,9 @@ function renderEventRow(e,now){
 }
 
 function renderAgentColumn(agentId,events,now,maxRows){
-  const role=agentId.replace('agent-','');
+  const role=agentId==='claude-code-hook'?'runtime':agentId.replace('agent-','');
   const m=ROLE_META[role]||{icon:'🤖',label:agentId,sub:''};
-  const ae=events.filter(e=>(e.event?.agentId??'')===agentId);
+  const ae=events.filter(e=>agentIdFor(e)===agentId);
   const bk=ae.filter(e=>e.decision==='block').length;
   const wn=ae.filter(e=>e.decision==='warn').length;
   const al=ae.filter(e=>e.decision==='allow').length;
@@ -1235,7 +1245,7 @@ function renderAgentColumn(agentId,events,now,maxRows){
     }
   }
   const moreBtn=ae.length>shown.length
-    ?'<div class="hac-footer"><button onclick="document.querySelectorAll(\'[data-agent=&quot;'+agentId+'&quot;]\').forEach(b=>b.click())">+'+( ae.length-shown.length)+'건 더 보기</button></div>':'';
+    ?'<div class="hac-footer"><button onclick="document.querySelectorAll(\\'[data-agent=&quot;'+agentId+'&quot;]\\').forEach(b=>b.click())">+'+( ae.length-shown.length)+'건 더 보기</button></div>':'';
   return '<div class="hist-agent-col '+borderCls+'">'+
     '<div class="hac-header">'+
       '<span class="hac-icon">'+m.icon+'</span>'+
@@ -1263,8 +1273,8 @@ function renderHistory(model){
   if(!fa){
     renderAgentSummaryHeader('',events);
     document.getElementById('hist-count').textContent='총 '+preFiltered.length+'건';
-    const agents=['agent-qa','agent-backend','agent-security'];
-    const unassigned=preFiltered.filter(e=>!agents.includes(e.event?.agentId??''));
+    const agents=['claude-code-hook','agent-qa','agent-backend','agent-security'];
+    const unassigned=preFiltered.filter(e=>!agents.includes(agentIdFor(e)));
     let html='<div class="hist-agent-grid">'+
       agents.map(aid=>renderAgentColumn(aid,preFiltered,now,20)).join('')+
     '</div>';
@@ -1282,7 +1292,7 @@ function renderHistory(model){
 
   // ── 특정 에이전트 모드: 요약 헤더 + 시간 그룹 리스트 ──
   renderAgentSummaryHeader(fa,events);
-  const filtered=preFiltered.filter(e=>(e.event?.agentId??'')===fa);
+  const filtered=preFiltered.filter(e=>agentIdFor(e)===fa);
   document.getElementById('hist-count').textContent='총 '+filtered.length+'건';
 
   if(!filtered.length){
@@ -1390,7 +1400,7 @@ function renderActionBanner(model){
   const ss=model.safetyScore||{score:100,level:'safe'};
   const recentBlocks=(model.events||[]).filter(e=>e.decision==='block'&&Date.now()-Date.parse(e.timestamp??'')<300000);
   if(recentBlocks.length>0){
-    const agents=[...new Set(recentBlocks.map(e=>e.event?.agentId).filter(Boolean))];
+    const agents=[...new Set(recentBlocks.map(e=>agentIdFor(e)).filter(Boolean))];
     el.style.display='flex';
     el.className='action-banner critical';
     el.innerHTML='<span class="action-banner-icon">🚨</span>'+
@@ -1415,9 +1425,9 @@ function toggleAgentDetail(agentId){
   document.querySelectorAll('.agent-detail-panel').forEach(p=>p.remove());
   if(!lastModel)return;
   const stats=(lastModel.agentStats||[]).find(s=>s.agentId===agentId);
-  const events=(lastModel.events||[]).filter(e=>(e.event?.agentId??'')===agentId);
+  const events=(lastModel.events||[]).filter(e=>agentIdFor(e)===agentId);
   if(!stats)return;
-  const role=agentId.replace('agent-','');
+  const role=agentId==='claude-code-hook'?'runtime':agentId.replace('agent-','');
   const m=ROLE_META[role]||{icon:'🤖',label:agentId,sub:''};
   const rate=stats.total?((stats.blockRate)*100).toFixed(0):'0';
 

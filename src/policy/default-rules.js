@@ -219,7 +219,7 @@ export const defaultRules = [
     appliesTo: ['prompt'],
     severity: 'high',
     category: 'secret_exfiltration',
-    pattern: '(\\.env|API\\s*키|토큰|비밀번호|개인키|프라이빗\\s*키).{0,40}(출력|보여|덤프|전송|보내)',
+    pattern: '(?:(\\.env|API\\s*키|토큰|비밀번호|패스워드|개인키|프라이빗\\s*키|시크릿|비밀).{0,60}(출력|보여|보여줘|알려|알려줘|덤프|읽어|열어|전송|보내|공유|노출|몰래)|(출력|보여|보여줘|알려|알려줘|덤프|읽어|열어|전송|보내|공유|노출|몰래).{0,60}(\\.env|API\\s*키|토큰|비밀번호|패스워드|개인키|프라이빗\\s*키|시크릿|비밀))',
     rationale: 'Korean prompt asks to expose secrets.',
     remediation: remediation.prompt
   },
