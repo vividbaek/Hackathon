@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -51,4 +52,48 @@ test('runGuardedCommand scans sensitive output', async () => {
 
   assert.equal(result.exitCode, 0);
   assert.equal(result.outputReport.decision, 'block');
+});
+
+test('runGuardedCommand redacts sensitive output before writing streams', async () => {
+  let displayed = '';
+  const result = await runGuardedCommand([
+    process.execPath,
+    '-e',
+    'console.log("AWS_SECRET_ACCESS_KEY=example")'
+  ], {
+    stdout: { write(chunk) { displayed += chunk; } },
+    stderr: { write() {} }
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.match(result.stdoutText, /AWS_SECRET_ACCESS_KEY=example/);
+  assert.doesNotMatch(displayed, /AWS_SECRET_ACCESS_KEY=example/);
+  assert.match(displayed, /\[REDACTED\]/);
+  assert.equal(result.streamReports.some((report) => report.decision === 'block'), true);
+});
+
+test('runGuardedCommand redacts sensitive output split across stream chunks', async () => {
+  let displayed = '';
+  const spawnImpl = () => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    process.nextTick(() => {
+      child.stdout.emit('data', Buffer.from('AWS_SECRET_'));
+      child.stdout.emit('data', Buffer.from('ACCESS_KEY=example\n'));
+      child.emit('close', 0);
+    });
+    return child;
+  };
+
+  const result = await runGuardedCommand(['fake'], {
+    spawnImpl,
+    stdout: { write(chunk) { displayed += chunk; } },
+    stderr: { write() {} }
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.match(result.stdoutText, /AWS_SECRET_ACCESS_KEY=example/);
+  assert.doesNotMatch(displayed, /AWS_SECRET_ACCESS_KEY=example/);
+  assert.match(displayed, /\[REDACTED\]/);
 });

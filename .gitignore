@@ -1,5 +1,13 @@
+.env
+.env.local
+.env.*.local
 .404gent/
 .claude/settings.local.json
 .claude/*.bak.*
 node_modules/
 npm-debug.log*
+daemon/es-daemon/.env
+
+# Keep local handoff docs visible even if a global ignore pattern matches *_docs.
+!wookseong_docs/
+!wookseong_docs/*.md

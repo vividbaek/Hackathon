@@ -1,7 +1,7 @@
 import { DEFAULT_BLOCK_SEVERITIES, compareSeverityDesc, highestSeverity, isValidSeverity } from './severity.js';
 import { compileRule, getRules } from './rules.js';
 
-export const VALID_EVENT_TYPES = new Set(['prompt', 'command', 'output', 'image', 'llm', 'vision_observation']);
+export const VALID_EVENT_TYPES = new Set(['prompt', 'command', 'output', 'image', 'llm', 'vision_observation', 'os']);
 
 function createEventId() {
   const random = Math.random().toString(36).slice(2, 10);

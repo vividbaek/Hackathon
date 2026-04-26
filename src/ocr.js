@@ -104,6 +104,7 @@ async function recognizeWithEasyOcr(buffer, cropInfo) {
  * Main Standardized Pipeline
  */
 export async function scanStandardized(inputSource, targetWidth = 2000, options = { invert: true }) {
+  const quiet = Boolean(options.quiet);
   // 1. Create a normalized master buffer
   const normalizedBuffer = await sharp(inputSource, { density: 300 })
     .resize({ width: targetWidth })
@@ -115,14 +116,16 @@ export async function scanStandardized(inputSource, targetWidth = 2000, options 
   const rows = 2;
   const cols = 2;
   const factor = 4; // Increased from 2 to 4 for extreme tiny text detection
-  const gridCrops = await processor.gridScaleUp(normalizedBuffer, rows, cols, factor, targetWidth);
+  const gridCrops = await processor.gridScaleUp(normalizedBuffer, rows, cols, factor, targetWidth, { quiet });
   
   const allResults = [];
   const cellW = Math.floor(metadata.width / cols);
   const cellH = Math.floor(metadata.height / rows);
 
-  const sourceLabel = Buffer.isBuffer(inputSource) ? 'Buffer' : inputSource;
-  console.error(`Processing ${sourceLabel} with standardized pipeline...`);
+  if (!quiet) {
+    const sourceLabel = Buffer.isBuffer(inputSource) ? 'Buffer' : inputSource;
+    console.log(`Processing ${sourceLabel} with standardized pipeline...`);
+  }
   
   // Decide which versions of the image to scan (Multi-pass Attack Detection)
   const buffersToScan = [
@@ -130,7 +133,9 @@ export async function scanStandardized(inputSource, targetWidth = 2000, options 
   ];
 
   // --- Attack Detection Passes ---
-  console.error('Running Attack Detection Passes...');
+  if (!quiet) {
+    console.log('Running Attack Detection Passes...');
+  }
   
   // Pass 1: Extreme Contrast & Gamma (Low-contrast hidden text)
   const extreme = await processor.applyExtremeContrast(normalizedBuffer);
@@ -157,7 +162,9 @@ export async function scanStandardized(inputSource, targetWidth = 2000, options 
   qrAttacks.push(...mainQr.map(q => ({ ...q, source: 'qr_main' })));
 
   for (const { buffer, label } of buffersToScan) {
-    console.error(` -> Processing [${label}] version...`);
+    if (!quiet) {
+      console.log(` -> Processing [${label}] version...`);
+    }
     const isExtreme = ['extreme_contrast', 'high_clahe', 'edge_detect', 'low_threshold'].includes(label);
     
     // Scan whole image
@@ -320,6 +327,7 @@ export async function scanStandardized(inputSource, targetWidth = 2000, options 
 
   return {
     resolution: { width: metadata.width, height: metadata.height },
+    normalizedBuffer,
     normalWords: cleanNormal,
     hiddenAttacks: finalAttacks.sort((a, b) => b.score - a.score)
   };
