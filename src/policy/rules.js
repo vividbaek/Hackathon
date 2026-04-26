@@ -1,5 +1,5 @@
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { defaultRules } from './default-rules.js';
 import { isValidSeverity } from './severity.js';
 
@@ -35,6 +35,14 @@ function loadRulePack(path) {
   return normalizeRulePack(readFileSync(absolutePath, 'utf8'), absolutePath);
 }
 
+function loadRulePackIfExists(path) {
+  const absolutePath = resolve(path);
+  if (!existsSync(absolutePath)) {
+    return [];
+  }
+  return normalizeRulePack(readFileSync(absolutePath, 'utf8'), absolutePath);
+}
+
 function applyOverrides(rules, overrides = []) {
   const byId = new Map(rules.map((rule) => [rule.id, { ...rule }]));
   for (const override of asArray(overrides)) {
@@ -55,9 +63,11 @@ function applyOverrides(rules, overrides = []) {
 
 export function getRules(config = {}) {
   const ruleConfig = config.rules;
+  const approvedPath = config.learn?.approvedRulesPath ?? join(config.dataDir ?? '.404gent', 'approved-rules.json');
+  const approvedRules = config.learn?.loadApprovedRules === false ? [] : loadRulePackIfExists(approvedPath);
 
   if (Array.isArray(ruleConfig)) {
-    return applyOverrides(ruleConfig, config.overrides);
+    return applyOverrides([...ruleConfig, ...approvedRules], config.overrides);
   }
 
   const paths = asArray(ruleConfig?.paths);
@@ -65,7 +75,7 @@ export function getRules(config = {}) {
   const customRules = asArray(ruleConfig?.custom);
   const overrides = asArray(ruleConfig?.overrides);
 
-  return applyOverrides([...defaultRules, ...pathRules, ...customRules], overrides);
+  return applyOverrides([...defaultRules, ...pathRules, ...approvedRules, ...customRules], overrides);
 }
 
 export function validateRules(rules) {

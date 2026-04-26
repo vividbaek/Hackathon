@@ -1,0 +1,11 @@
+{
+  "dataDir": ".404gent",
+  "learn": {
+    "inference": {
+      "enabled": true,
+      "provider": "openai",
+      "model": "gpt-5-mini",
+      "apiKeyEnv": "OPENAI_API_KEY"
+    }
+  }
+}

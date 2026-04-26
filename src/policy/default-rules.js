@@ -2,7 +2,8 @@ const remediation = {
   prompt: 'Remove the unsafe instruction and restate the task with explicit safe boundaries.',
   command: 'Review the command manually before execution and replace it with a scoped, reversible operation.',
   output: 'Redact the sensitive value before showing or storing terminal output.',
-  llm: 'Do not persist or forward this LLM content; route it through policy review and keep forensic evidence.'
+  llm: 'Do not persist or forward this LLM content; route it through policy review and keep forensic evidence.',
+  os: 'Keep the OS event in audit logs and require explicit review before allowing the process to continue sensitive activity.'
 };
 
 export const defaultRules = [
@@ -32,6 +33,24 @@ export const defaultRules = [
     pattern: '\\b(?:qr|barcode)\\b.{0,80}\\b(?:token|secret|password|exfil|upload|send)\\b',
     rationale: 'Image observation references QR/barcode-based secret movement.',
     remediation: 'Block downstream tool use and preserve image hash plus extracted text for review.'
+  },
+  {
+    id: 'llm-injection-attempt',
+    appliesTo: ['llm'],
+    severity: 'high',
+    category: 'prompt_injection',
+    pattern: '\\b(?:ignore|disregard|forget|override)\\b.{0,80}\\b(?:previous|prior|above|all)\\b.{0,60}\\b(?:instructions?|rules?|policy|context|system)\\b',
+    rationale: 'LLM output contains a prompt injection pattern targeting prior instructions.',
+    remediation: 'Do not forward this output to another agent; flag it as a handoff poisoning attempt.'
+  },
+  {
+    id: 'llm-guardrail-disable-attempt',
+    appliesTo: ['llm'],
+    severity: 'critical',
+    category: 'guardrail_tampering',
+    pattern: '\\b(?:disable|remove|bypass|shutdown|turn off)\\b.{0,80}\\b(?:guardrail|scanner|policy|404gent|safety|monitor|hook)\\b',
+    rationale: 'LLM output attempts to disable runtime guardrails or safety monitors.',
+    remediation: remediation.llm
   },
   {
     id: 'llm-memory-poisoning',
@@ -97,6 +116,78 @@ export const defaultRules = [
     remediation: remediation.llm
   },
   {
+    id: 'os-sensitive-file-open',
+    appliesTo: ['os'],
+    severity: 'critical',
+    category: 'sensitive_file_access',
+    pattern: '\\bos\\s+open\\b[^\\n]*(?:path="?[^"\\s]*(?:\\.env(?:\\.(?:local|production|development))?|credentials\\.json|secrets\\.json|\\.npmrc|\\.pypirc|\\.netrc|\\.kube/config)|/(?:\\.ssh|\\.aws|\\.gnupg)/)',
+    rationale: 'OS Guard observed a process opening a file that commonly contains credentials.',
+    remediation: remediation.os
+  },
+  {
+    id: 'os-private-key-open',
+    appliesTo: ['os'],
+    severity: 'critical',
+    category: 'private_key_access',
+    pattern: '\\bos\\s+open\\b[^\\n]*(?:id_rsa|id_ed25519|id_ecdsa|\\.pem|\\.key|\\.p12|\\.pfx|certificate|private[_ -]?key)',
+    rationale: 'OS Guard observed a process opening private key or certificate material.',
+    remediation: remediation.os
+  },
+  {
+    id: 'os-cloud-credentials-open',
+    appliesTo: ['os'],
+    severity: 'critical',
+    category: 'cloud_credential_access',
+    pattern: '\\bos\\s+open\\b[^\\n]*(?:aws_credentials|\\.aws/credentials|gcp_credentials|google_application_credentials|service-account\\.json|service_account\\.json|application_default_credentials\\.json)',
+    rationale: 'OS Guard observed a process opening cloud provider credentials.',
+    remediation: remediation.os
+  },
+  {
+    id: 'os-network-tool-exec',
+    appliesTo: ['os'],
+    severity: 'medium',
+    category: 'network_execution',
+    pattern: '\\bos\\s+exec\\b[^\\n]*\\b(?:curl|wget|nc|netcat|scp|rsync)\\b',
+    rationale: 'OS Guard observed execution of a network transfer tool.',
+    remediation: remediation.os
+  },
+  {
+    id: 'os-destructive-exec',
+    appliesTo: ['os'],
+    severity: 'critical',
+    category: 'destructive_execution',
+    pattern: '\\bos\\s+exec\\b[^\\n]*(?:\\brm\\b[^\\n]*\\s-(?:[a-z]*r[a-z]*f|[a-z]*f[a-z]*r)|\\b(?:mkfs|fdisk)\\b|\\bdiskutil\\s+erase\\b|\\bdd\\s+if=)',
+    rationale: 'OS Guard observed a destructive executable or destructive arguments.',
+    remediation: remediation.os
+  },
+  {
+    id: 'os-reverse-shell-exec',
+    appliesTo: ['os'],
+    severity: 'critical',
+    category: 'reverse_shell',
+    pattern: '\\bos\\s+exec\\b[^\\n]*(?:\\bnc\\b[^\\n]*\\s-e\\s|/dev/tcp/|mkfifo\\s+/tmp)',
+    rationale: 'OS Guard observed reverse-shell-like execution arguments.',
+    remediation: remediation.os
+  },
+  {
+    id: 'os-sensitive-file-unlink',
+    appliesTo: ['os'],
+    severity: 'critical',
+    category: 'sensitive_file_delete',
+    pattern: '\\bos\\s+unlink\\b[^\\n]*(?:path="?[^"\\s]*(?:\\.env(?:\\.(?:local|production|development))?|credentials\\.json|secrets\\.json|\\.npmrc|\\.pypirc|\\.netrc|\\.kube/config)|/(?:\\.ssh|\\.aws|\\.gnupg)/)',
+    rationale: 'OS Guard simulation observed deletion of a file that commonly contains credentials.',
+    remediation: remediation.os
+  },
+  {
+    id: 'os-destructive-unlink',
+    appliesTo: ['os'],
+    severity: 'high',
+    category: 'destructive_file_delete',
+    pattern: '\\bos\\s+unlink\\b[^\\n]*(?:path="?[^"\\s]*(?:/Desktop/|/Documents/|/Downloads/|/workspace/|/src/|/\\.git/))',
+    rationale: 'OS Guard simulation observed deletion in a high-impact project or user data path.',
+    remediation: remediation.os
+  },
+  {
     id: 'prompt-injection-english',
     appliesTo: ['prompt'],
     severity: 'high',
@@ -146,7 +237,7 @@ export const defaultRules = [
     appliesTo: ['prompt'],
     severity: 'high',
     category: 'secret_exfiltration',
-    pattern: '(\\.env|API\\s*키|토큰|비밀번호|개인키|프라이빗\\s*키).{0,40}(출력|보여|덤프|전송|보내)',
+    pattern: '(?:(\\.env|API\\s*키|토큰|비밀번호|패스워드|개인키|프라이빗\\s*키|시크릿|비밀).{0,60}(출력|보여|보여줘|알려|알려줘|덤프|읽어|열어|전송|보내|공유|노출|몰래)|(출력|보여|보여줘|알려|알려줘|덤프|읽어|열어|전송|보내|공유|노출|몰래).{0,60}(\\.env|API\\s*키|토큰|비밀번호|패스워드|개인키|프라이빗\\s*키|시크릿|비밀))',
     rationale: 'Korean prompt asks to expose secrets.',
     remediation: remediation.prompt
   },
