@@ -74,9 +74,36 @@ const graphEdges = [
 ];
 
 const RUNTIME_HOOK_AGENT_ID = 'claude-code-hook';
+const AGENT_ALIASES = {
+  runtime: RUNTIME_HOOK_AGENT_ID,
+  hook: RUNTIME_HOOK_AGENT_ID,
+  'claude-code-hook': RUNTIME_HOOK_AGENT_ID,
+  qa: 'agent-qa',
+  'agent-qa': 'agent-qa',
+  backend: 'agent-backend',
+  'agent-backend': 'agent-backend',
+  security: 'agent-security',
+  'agent-security': 'agent-security'
+};
+
+function normalizeDashboardAgentId(value) {
+  const raw = String(value ?? '').trim();
+  if (!raw) return '';
+  return AGENT_ALIASES[raw] ?? AGENT_ALIASES[raw.toLowerCase()] ?? raw;
+}
+
+function agentFromSource(source) {
+  const match = String(source ?? '').match(/^agent:([^:]+):os$/);
+  return match ? match[1] : '';
+}
 
 function dashboardAgentId(e) {
-  return e.event?.agentId ?? (e.event?.source === 'claude-code-hook' ? RUNTIME_HOOK_AGENT_ID : '');
+  return normalizeDashboardAgentId(
+    e.event?.agentId ??
+    e.event?.meta?.agent ??
+    agentFromSource(e.event?.source) ??
+    (e.event?.source === 'claude-code-hook' ? RUNTIME_HOOK_AGENT_ID : '')
+  );
 }
 
 const threeAgentRunbook = [
@@ -990,12 +1017,15 @@ const ST_EN    = { idle:'IDLE', allow:'ALLOW', warn:'WARN', block:'BLOCK' };
 const SEV_CLS  = { critical:'critical', high:'high', medium:'medium', low:'low' };
 const AGENT_LABEL = {'claude-code-hook':'Runtime Hook','agent-qa':'QA','agent-backend':'Backend','agent-security':'Security'};
 const SURF_COLORS = {prompt:'#2563eb',command:'#d97706',output:'#059669',llm:'#0891b2',image:'#7c3aed'};
+const AGENT_ALIASES = {runtime:'claude-code-hook',hook:'claude-code-hook','claude-code-hook':'claude-code-hook',qa:'agent-qa','agent-qa':'agent-qa',backend:'agent-backend','agent-backend':'agent-backend',security:'agent-security','agent-security':'agent-security'};
 
 function h(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function fmt(v){return v?new Date(v).toLocaleTimeString('ko-KR',{hour12:false}):'—';}
 function fmtFull(v){return v?new Date(v).toLocaleString('ko-KR',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}):'—';}
 function surf(e){return e.event?.type??e.surface??'unknown';}
-function agentIdFor(e){return e.event?.agentId??(e.event?.source==='claude-code-hook'?'claude-code-hook':'');}
+function normalizeAgentId(v){const raw=String(v??'').trim();return raw?(AGENT_ALIASES[raw]||AGENT_ALIASES[raw.toLowerCase()]||raw):'';}
+function agentFromSource(s){const m=String(s??'').match(/^agent:([^:]+):os$/);return m?m[1]:'';}
+function agentIdFor(e){return normalizeAgentId(e.event?.agentId??e.event?.meta?.agent??agentFromSource(e.event?.source)??(e.event?.source==='claude-code-hook'?'claude-code-hook':''));}
 function bdg(s){return '<span class="badge badge-'+h(s)+'">'+h(s)+'</span>';}
 function sevPill(s){return '<span class="sev '+h(SEV_CLS[s]||'low')+'">'+h(s)+'</span>';}
 
