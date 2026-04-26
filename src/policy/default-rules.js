@@ -2,7 +2,8 @@ const remediation = {
   prompt: 'Remove the unsafe instruction and restate the task with explicit safe boundaries.',
   command: 'Review the command manually before execution and replace it with a scoped, reversible operation.',
   output: 'Redact the sensitive value before showing or storing terminal output.',
-  llm: 'Do not persist or forward this LLM content; route it through policy review and keep forensic evidence.'
+  llm: 'Do not persist or forward this LLM content; route it through policy review and keep forensic evidence.',
+  os: 'Keep the OS event in audit logs and require explicit review before allowing the process to continue sensitive activity.'
 };
 
 export const defaultRules = [
@@ -95,6 +96,60 @@ export const defaultRules = [
     pattern: '(기억|메모리|저장).{0,80}(이전|기존|앞선).{0,40}(지시|정책|규칙).{0,40}(무시|우회|삭제)',
     rationale: 'Korean LLM content attempts to poison future memory or policy behavior.',
     remediation: remediation.llm
+  },
+  {
+    id: 'os-sensitive-file-open',
+    appliesTo: ['os'],
+    severity: 'critical',
+    category: 'sensitive_file_access',
+    pattern: '\\bos\\s+open\\b[^\\n]*(?:path="?[^"\\s]*(?:\\.env(?:\\.(?:local|production|development))?|credentials\\.json|secrets\\.json|\\.npmrc|\\.pypirc|\\.netrc|\\.kube/config)|/(?:\\.ssh|\\.aws|\\.gnupg)/)',
+    rationale: 'OS Guard observed a process opening a file that commonly contains credentials.',
+    remediation: remediation.os
+  },
+  {
+    id: 'os-private-key-open',
+    appliesTo: ['os'],
+    severity: 'critical',
+    category: 'private_key_access',
+    pattern: '\\bos\\s+open\\b[^\\n]*(?:id_rsa|id_ed25519|id_ecdsa|\\.pem|\\.key|\\.p12|\\.pfx|certificate|private[_ -]?key)',
+    rationale: 'OS Guard observed a process opening private key or certificate material.',
+    remediation: remediation.os
+  },
+  {
+    id: 'os-cloud-credentials-open',
+    appliesTo: ['os'],
+    severity: 'critical',
+    category: 'cloud_credential_access',
+    pattern: '\\bos\\s+open\\b[^\\n]*(?:aws_credentials|\\.aws/credentials|gcp_credentials|google_application_credentials|service-account\\.json|service_account\\.json|application_default_credentials\\.json)',
+    rationale: 'OS Guard observed a process opening cloud provider credentials.',
+    remediation: remediation.os
+  },
+  {
+    id: 'os-network-tool-exec',
+    appliesTo: ['os'],
+    severity: 'medium',
+    category: 'network_execution',
+    pattern: '\\bos\\s+exec\\b[^\\n]*\\b(?:curl|wget|nc|netcat|scp|rsync)\\b',
+    rationale: 'OS Guard observed execution of a network transfer tool.',
+    remediation: remediation.os
+  },
+  {
+    id: 'os-destructive-exec',
+    appliesTo: ['os'],
+    severity: 'critical',
+    category: 'destructive_execution',
+    pattern: '\\bos\\s+exec\\b[^\\n]*(?:\\brm\\b[^\\n]*\\s-(?:[a-z]*r[a-z]*f|[a-z]*f[a-z]*r)|\\b(?:mkfs|fdisk)\\b|\\bdiskutil\\s+erase\\b|\\bdd\\s+if=)',
+    rationale: 'OS Guard observed a destructive executable or destructive arguments.',
+    remediation: remediation.os
+  },
+  {
+    id: 'os-reverse-shell-exec',
+    appliesTo: ['os'],
+    severity: 'critical',
+    category: 'reverse_shell',
+    pattern: '\\bos\\s+exec\\b[^\\n]*(?:\\bnc\\b[^\\n]*\\s-e\\s|/dev/tcp/|mkfifo\\s+/tmp)',
+    rationale: 'OS Guard observed reverse-shell-like execution arguments.',
+    remediation: remediation.os
   },
   {
     id: 'prompt-injection-english',

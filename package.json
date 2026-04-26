@@ -12,6 +12,7 @@
     "demo:reset": "bash scripts/demo-reset.sh",
     "demo:restart": "npm run demo:reset",
     "demo:judge": "bash scripts/judge-demo.sh",
+    "demo:os-guard": "bash scripts/os-guard-demo.sh",
     "demo:recovery": "bash scripts/recovery-demo.sh",
     "demo:cmux": "bash scripts/cmux-demo.sh",
     "demo:cmux-native": "bash scripts/cmux-native-demo.sh",

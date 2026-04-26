@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 export function getStatePath(config = {}) {
@@ -12,6 +12,9 @@ export async function readState(config = {}) {
     if (error.code === 'ENOENT') {
       return { eventCount: 0, lastDecision: null, lastSeverity: 'info' };
     }
+    if (error instanceof SyntaxError) {
+      return { eventCount: 0, lastDecision: null, lastSeverity: 'info', recoveredFromCorruptState: true };
+    }
     throw error;
   }
 }
@@ -19,7 +22,9 @@ export async function readState(config = {}) {
 export async function writeState(state, config = {}) {
   const path = getStatePath(config);
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, `${JSON.stringify(state, null, 2)}\n`);
+  const tempPath = `${path}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+  await writeFile(tempPath, `${JSON.stringify(state, null, 2)}\n`);
+  await rename(tempPath, path);
 }
 
 export async function updateState(result, config = {}) {
