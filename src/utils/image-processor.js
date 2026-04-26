@@ -39,7 +39,7 @@ export async function gridScaleUp(input, rows = 2, cols = 2, factor = 2, targetW
       const actualWidth = (c === cols - 1) ? width - left : cellWidth;
       const actualHeight = (r === rows - 1) ? height - top : cellHeight;
 
-      console.log(`  -> Crop [${r},${c}]: ${actualWidth}x${actualHeight} at (${left},${top})`);
+      console.error(`  -> Crop [${r},${c}]: ${actualWidth}x${actualHeight} at (${left},${top})`);
 
       // Skip very small crops or slivers (user requested to drop too small images)
       if (actualWidth < 100 || actualHeight < 100) {
