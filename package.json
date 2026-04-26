@@ -27,5 +27,9 @@
   },
   "engines": {
     "node": ">=20"
+  },
+  "dependencies": {
+    "sharp": "^0.34.5",
+    "tesseract.js": "^7.0.0"
   }
 }
