@@ -4,7 +4,8 @@ import { mergeReports, scanText } from './policy/engine.js';
 import { encodeImageFile, createVisionProviderFromConfig } from './providers/vision-llm.js';
 import { highestSeverity } from './policy/severity.js';
 import { runGuardedCommand } from './runner.js';
-import { createAgentHandoff, saveAgentHandoff } from './harness.js';
+import { createAgentHandoff, saveAgentHandoff, pipeToAgent } from './harness.js';
+import { runTower } from './tower.js';
 import { guardAndRecord, recordReport } from './guard.js';
 import { startPolicyServer } from './server.js';
 import { createExecEvent, createOpenEvent } from './integrations/os-guard.js';
@@ -21,6 +22,7 @@ Usage:
   404gent scan-image --file <image-path>
   404gent scan-llm <text>
   404gent agent --role <qa|backend|security> -- <task>
+  404gent pipe --role <from> --to <to> -- <output-text>
   404gent run -- <command> [args...]
   404gent server
   404gent os-guard status
@@ -50,6 +52,7 @@ function parseArgs(argv) {
     configPath: undefined,
     filePath: undefined,
     role: 'qa',
+    to: undefined,
     companyId: undefined,
     agent: undefined,
     pid: undefined,
@@ -76,6 +79,8 @@ function parseArgs(argv) {
       options.filePath = args.shift();
     } else if (arg === '--role') {
       options.role = args.shift() ?? 'qa';
+    } else if (arg === '--to') {
+      options.to = args.shift();
     } else if (arg === '--company') {
       options.companyId = args.shift();
     } else if (arg === '--agent' || arg === '--name') {
@@ -169,7 +174,7 @@ export async function main(argv = process.argv.slice(2)) {
   }
 
   if (command === 'tower') {
-    console.log('404gent tower: runtime guardrail console is not implemented yet.');
+    await runTower(config);
     return 0;
   }
 
@@ -199,6 +204,44 @@ export async function main(argv = process.argv.slice(2)) {
     return handoff.promptReport.decision === 'block' ? 1 : 0;
   }
 
+  if (command === 'pipe') {
+    const fromRole   = options.role;
+    const toRole     = options.to;
+    const outputText = passthrough.length > 0 ? passthrough.join(' ') : text;
+
+    if (!toRole) {
+      console.error('pipe requires --to <role>  (e.g. --to backend)');
+      return 2;
+    }
+
+    const result = pipeToAgent({ fromRole, toRole, outputText, config, companyId: config.companyId });
+    await recordReport(result.pipeReport, config);
+
+    if (result.blocked) {
+      if (options.json) {
+        console.log(JSON.stringify({ blocked: true, pipeReport: result.pipeReport }, null, 2));
+      } else {
+        console.error(`\n🚫 Pipe BLOCKED (${fromRole} → ${toRole}): cross-agent contamination detected.`);
+        for (const f of result.pipeReport.findings) {
+          console.error(`  [${f.severity}] ${f.id}: ${f.rationale}`);
+        }
+      }
+      return 1;
+    }
+
+    const paths = await saveAgentHandoff(result.handoff, config);
+    await recordReport(result.handoff.promptReport, config);
+    await recordReport(result.handoff.handoffReport, config);
+
+    if (options.json) {
+      console.log(JSON.stringify({ blocked: false, pipeReport: result.pipeReport, handoff: result.handoff, paths }, null, 2));
+    } else {
+      console.log(result.handoff.brief);
+      console.log(`\nPiped: ${fromRole} → ${toRole}  (saved: ${paths.rolePath})`);
+    }
+    return 0;
+  }
+
   if (command === 'server') {
     const { host, port } = await startPolicyServer({ configPath: options.configPath });
     console.log(`404gent policy server listening on http://${host}:${port}`);
@@ -209,6 +252,7 @@ export async function main(argv = process.argv.slice(2)) {
   if (command === 'os-guard') {
     return handleOsGuardCommand({ argv: positionals.slice(1), options, config });
   }
+
 
   const surfaces = {
     'scan-prompt': 'prompt',

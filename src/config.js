@@ -16,6 +16,9 @@ export const DEFAULT_CONFIG = {
     provider: 'anthropic',
     model: 'claude-sonnet-4-5',
     apiKeyEnv: 'ANTHROPIC_API_KEY',
+    visionProvider: 'anthropic',
+    googleApiKeyEnv: 'GOOGLE_API_KEY',
+    googleVisionModel: 'gemini-2.0-flash',
     reviewTypes: ['image', 'vision_observation', 'llm', 'prompt'],
     reviewDecisions: ['allow', 'warn']
   },
