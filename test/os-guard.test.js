@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { analyzeEvent } from '../src/policy/engine.js';
 import { guardAndRecord } from '../src/guard.js';
 import { createExecEvent, createOpenEvent, createOsEventFromPayload, createUnlinkEvent } from '../src/integrations/os-guard.js';
+import http from 'node:http';
 import { createPolicyServer } from '../src/server.js';
 
 test('OS open event preserves metadata and blocks sensitive files', () => {
@@ -135,8 +136,15 @@ test('policy server serves local evidence images from data directory', async (t)
     assert.equal(response.headers.get('content-type'), 'image/png');
     assert.deepEqual([...body], [0x89, 0x50, 0x4e, 0x47]);
 
-    const traversal = await fetch(`http://127.0.0.1:${port}/images/%2e%2e/events.jsonl`);
-    assert.equal(traversal.status, 400);
+    const traversalStatus = await new Promise((resolve, reject) => {
+      const req = http.get({
+        hostname: '127.0.0.1',
+        port,
+        path: '/images/%2e%2e/events.jsonl'
+      }, (res) => resolve(res.statusCode));
+      req.on('error', reject);
+    });
+    assert.equal(traversalStatus, 400);
   } finally {
     server.close();
   }
