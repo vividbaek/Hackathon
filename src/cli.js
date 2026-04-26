@@ -9,6 +9,15 @@ import { guardAndRecord, recordReport } from './guard.js';
 import { startPolicyServer } from './server.js';
 import { createExecEvent, createOpenEvent } from './integrations/os-guard.js';
 import { fetchDaemonStatus, findProcessIdsByNames, registerPidWithDaemon } from './integrations/es-daemon.js';
+import {
+  analyze as analyzeLearn,
+  approveRule,
+  pending as pendingLearn,
+  rejectRule,
+  shadowStatus,
+  status as learnStatus,
+  testRule
+} from './learn/index.js';
 
 const HELP = `404gent - Terminal-first guardrails for AI coding agents in cmux.
 
@@ -27,6 +36,13 @@ Usage:
   404gent os-guard simulate-open <path> [--agent name] [--pid pid]
   404gent os-guard simulate-exec <command...> [--agent name] [--pid pid]
   404gent os-guard register-existing [--names codex,claude,gemini,opencode]
+  404gent learn status
+  404gent learn analyze
+  404gent learn pending
+  404gent learn shadow-status
+  404gent learn test --rule <id>
+  404gent learn approve --rule <id>
+  404gent learn reject --rule <id>
   404gent agent --name demo --with-os-guard -- <command>
   404gent doctor
   404gent tower
@@ -41,6 +57,7 @@ Options:
   --pid <pid>       Process id for OS Guard events.
   --names <names>   Comma-separated process names for register-existing.
   --with-os-guard   Register spawned agent process with OS Guard.
+  --rule <id>       Rule id for learn test/approve/reject.
 `;
 
 function parseArgs(argv) {
@@ -55,7 +72,8 @@ function parseArgs(argv) {
     pid: undefined,
     names: undefined,
     withOsGuard: false,
-    name: undefined
+    name: undefined,
+    rule: undefined
   };
   const positionals = [];
   const separatorIndex = args.indexOf('--');
@@ -88,6 +106,8 @@ function parseArgs(argv) {
       options.names = args.shift();
     } else if (arg === '--with-os-guard') {
       options.withOsGuard = true;
+    } else if (arg === '--rule') {
+      options.rule = args.shift();
     } else {
       positionals.push(arg);
     }
@@ -210,6 +230,10 @@ export async function main(argv = process.argv.slice(2)) {
     return handleOsGuardCommand({ argv: positionals.slice(1), options, config });
   }
 
+  if (command === 'learn') {
+    return handleLearnCommand({ argv: positionals.slice(1), options, config });
+  }
+
   const surfaces = {
     'scan-prompt': 'prompt',
     'scan-command': 'command',
@@ -330,6 +354,45 @@ async function handleOsGuardCommand({ argv, options, config }) {
 
   console.error(`Unknown os-guard command: ${subcommand}`);
   return 2;
+}
+
+async function handleLearnCommand({ argv, options, config }) {
+  const subcommand = argv[0] ?? 'status';
+  let result;
+
+  if (subcommand === 'status') {
+    result = await learnStatus(config);
+  } else if (subcommand === 'analyze') {
+    result = await analyzeLearn(config, { manual: true });
+  } else if (subcommand === 'pending') {
+    result = await pendingLearn(config);
+  } else if (subcommand === 'shadow-status') {
+    result = await shadowStatus(config);
+  } else if (subcommand === 'test') {
+    if (!options.rule) {
+      console.error('learn test requires --rule <id>.');
+      return 2;
+    }
+    result = await testRule(options.rule, config);
+  } else if (subcommand === 'approve') {
+    if (!options.rule) {
+      console.error('learn approve requires --rule <id>.');
+      return 2;
+    }
+    result = await approveRule(options.rule, config);
+  } else if (subcommand === 'reject') {
+    if (!options.rule) {
+      console.error('learn reject requires --rule <id>.');
+      return 2;
+    }
+    result = await rejectRule(options.rule, config);
+  } else {
+    console.error(`Unknown learn command: ${subcommand}`);
+    return 2;
+  }
+
+  console.log(JSON.stringify(result, null, 2));
+  return 0;
 }
 
 async function handleAgentCommand({ argv, options }) {

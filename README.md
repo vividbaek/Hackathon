@@ -65,6 +65,15 @@ export ANTHROPIC_API_KEY="..."
 node src/cli.js --config examples/404gent.anthropic.config.json scan-image "suspicious OCR text"
 ```
 
+Self-healing 룰 후보 생성에 OpenAI를 쓰려면 로컬 환경변수로 키를 설정합니다. GitHub secret `OPENAI_API_KEY`는 GitHub Actions 안에서만 자동으로 제공되므로, 로컬 CLI에서는 별도로 export해야 합니다.
+
+```sh
+export OPENAI_API_KEY="..."
+node src/cli.js --config examples/404gent.openai-learn.config.json learn analyze
+```
+
+OpenAI 호출이 실패하거나 키가 없으면 기존 deterministic generator로 fallback됩니다. 생성된 후보는 계속 shadow/pending에만 저장되고, `learn approve --rule <id>` 전에는 실제 차단 룰로 적용되지 않습니다.
+
 ## 로컬 에이전트 대시보드
 
 LangGraph 스타일로 에이전트 상태, 보안 경고, self-loop 룰 후보를 보려면 로컬 대시보드를 실행합니다.

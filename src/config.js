@@ -19,6 +19,14 @@ export const DEFAULT_CONFIG = {
     reviewTypes: ['image', 'vision_observation', 'llm', 'prompt'],
     reviewDecisions: ['allow', 'warn']
   },
+  learn: {
+    inference: {
+      enabled: true,
+      provider: 'openai',
+      model: 'gpt-5-mini',
+      apiKeyEnv: 'OPENAI_API_KEY'
+    }
+  },
   rules: defaultRules
 };
 

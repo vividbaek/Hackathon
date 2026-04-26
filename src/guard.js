@@ -4,6 +4,7 @@ import { highestSeverity } from './policy/severity.js';
 import { appendVectorDocument } from './vector-store.js';
 import { updateState } from './state.js';
 import { createLlmProvider, shouldReviewWithLlm } from './providers/llm.js';
+import { evaluateShadowReport } from './learn/shadow.js';
 
 export async function guard(event, config = {}) {
   let result = scanText({
@@ -29,6 +30,7 @@ export async function guard(event, config = {}) {
 }
 
 export async function recordReport(report, config = {}) {
+  await evaluateShadowReport(report, config);
   await appendAuditEvent(report, config);
   await appendVectorDocument(report, config);
   await updateState(report, config);
