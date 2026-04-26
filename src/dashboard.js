@@ -180,6 +180,49 @@ function collectHiddenPromptDiscoveries(events) {
     }).slice(-10).reverse();
 }
 
+function computeSafetyScore(events, candidates) {
+  if (events.length === 0) return { score: 100, level: 'safe', label: '안전' };
+  const now = Date.now();
+  const RECENCY = 5 * 60 * 1000;
+  let penalty = 0;
+  for (const e of events) {
+    const recent = now - Date.parse(e.timestamp ?? e.scannedAt ?? '') < RECENCY;
+    if (e.decision === 'block') penalty += recent ? 25 : 15;
+    else if (e.decision === 'warn') penalty += recent ? 8 : 4;
+    penalty += (e.event?.evidence?.hiddenPrompts?.length ?? 0) * 20;
+  }
+  penalty += (Array.isArray(candidates) ? candidates.length : 0) * 3;
+  const score = Math.max(0, Math.min(100, 100 - penalty));
+  const level = score >= 80 ? 'safe' : score >= 50 ? 'caution' : score >= 20 ? 'danger' : 'critical';
+  const label = { safe: '안전', caution: '주의', danger: '위험', critical: '심각' }[level];
+  return { score, level, label };
+}
+
+function computeAgentStats(events) {
+  const ROLES = ['qa', 'backend', 'security'];
+  return ROLES.map(role => {
+    const agentId = `agent-${role}`;
+    const agentEvents = events.filter(e => (e.event?.agentId ?? '') === agentId);
+    const blockEvents = agentEvents.filter(e => e.decision === 'block');
+    const ruleFreq = {};
+    for (const e of blockEvents) {
+      for (const f of (e.findings ?? [])) { ruleFreq[f.id] = (ruleFreq[f.id] ?? 0) + 1; }
+    }
+    const surfCounts = {};
+    for (const e of agentEvents) { const t = e.surface ?? e.event?.type ?? 'unknown'; surfCounts[t] = (surfCounts[t] ?? 0) + 1; }
+    return {
+      agentId, role,
+      total: agentEvents.length,
+      block: blockEvents.length,
+      warn: agentEvents.filter(e => e.decision === 'warn').length,
+      allow: agentEvents.filter(e => e.decision === 'allow').length,
+      blockRate: agentEvents.length ? blockEvents.length / agentEvents.length : 0,
+      topRules: Object.entries(ruleFreq).sort((a, b) => b[1] - a[1]).slice(0, 5),
+      surfaces: surfCounts
+    };
+  });
+}
+
 function summarizeCounts(events, candidates) {
   return {
     total: events.length,
@@ -226,6 +269,60 @@ function collectTimeline(events, candidates) {
     .slice(0, 50);
 }
 
+function buildAgentFlows(events) {
+  const ROLES = ['qa', 'backend', 'security'];
+  const STAGE_ORDER = ['prompt', 'llm', 'command', 'output'];
+  return ROLES.map(role => {
+    const agentId = `agent-${role}`;
+    const agentEvents = events.filter(e => (e.event?.agentId ?? '') === agentId);
+    const bySession = {};
+    for (const ev of agentEvents) {
+      const sid = ev.event?.meta?.sessionId ?? 'default';
+      if (!bySession[sid]) bySession[sid] = [];
+      bySession[sid].push(ev);
+    }
+    let latestSession = [], latestTime = '';
+    for (const evts of Object.values(bySession)) {
+      const t = evts.reduce((m, e) => { const ts = e.timestamp ?? e.scannedAt ?? ''; return ts > m ? ts : m; }, '');
+      if (t > latestTime) { latestTime = t; latestSession = evts; }
+    }
+    const stageMap = {};
+    for (const ev of latestSession) {
+      const surface = ev.surface ?? ev.event?.type ?? 'unknown';
+      if (STAGE_ORDER.includes(surface)) {
+        if (!stageMap[surface] || ev.decision === 'block') {
+          stageMap[surface] = {
+            surface, decision: ev.decision, findings: ev.findings ?? [],
+            text: (ev.event?.text ?? ev.text ?? '').slice(0, 80),
+            timestamp: ev.timestamp ?? ev.scannedAt
+          };
+        }
+      }
+    }
+    const stages = STAGE_ORDER.filter(s => stageMap[s]).map(s => stageMap[s]);
+    const blockStage = stages.find(s => s.decision === 'block');
+    const overallDecision = blockStage ? 'block'
+      : stages.some(s => s.decision === 'warn') ? 'warn'
+      : stages.length > 0 ? 'allow' : 'idle';
+    return { role, agentId, overallDecision, stages, blockStage: blockStage?.surface ?? null, eventCount: latestSession.length, lastSeen: latestTime || null };
+  });
+}
+
+function buildVisionFlow(events) {
+  const imgEvents = events.filter(e => ['image', 'vision_observation'].includes(e.surface ?? e.event?.type ?? ''));
+  if (imgEvents.length === 0) return null;
+  const latest = imgEvents.at(-1);
+  const ev = latest.event?.evidence ?? {};
+  return {
+    imagePath: ev.imagePath ?? null, imageHash: ev.imageHash ?? null,
+    extractedText: ev.extractedText ?? (latest.event?.text ?? ''),
+    hiddenPrompts: ev.hiddenPrompts ?? [], confidence: ev.confidence ?? null,
+    regions: ev.regions ?? [], objects: ev.objects ?? [],
+    decision: latest.decision, findings: latest.findings ?? [],
+    timestamp: latest.timestamp ?? latest.scannedAt
+  };
+}
+
 export function buildDashboardModel({ events = [], candidates = [], state = {} } = {}) {
   const recentEvents = events.slice(-100);
   const candidateList = Array.isArray(candidates) ? candidates : candidates.candidates ?? [];
@@ -234,9 +331,13 @@ export function buildDashboardModel({ events = [], candidates = [], state = {} }
     generatedAt: new Date().toISOString(),
     state,
     counts: summarizeCounts(recentEvents, candidateList),
+    safetyScore: computeSafetyScore(recentEvents, candidateList),
+    agentStats: computeAgentStats(recentEvents),
     agents,
     edges: graphEdges.map(([from, to]) => ({ from, to })),
     runbook: threeAgentRunbook,
+    agentFlows: buildAgentFlows(recentEvents),
+    visionFlow: buildVisionFlow(recentEvents),
     alerts: collectAlerts(recentEvents),
     imageFindings: collectImageFindings(recentEvents),
     hiddenPromptDiscoveries: collectHiddenPromptDiscoveries(recentEvents),
@@ -432,6 +533,7 @@ svg.graph{display:block;width:100%;min-width:960px;height:310px;}
 .badge-output{background:#d1fae5;color:#065f46;}
 .badge-llm{background:#cffafe;color:#0e7490;}
 .badge-unknown{background:#f3f4f6;color:#6b7280;}
+.badge-agent{background:#fce7f3;color:#9d174d;}
 
 /* ── 사이드바 ── */
 .side-sec{background:var(--panel);border:1px solid var(--border);border-radius:var(--r);}
@@ -474,7 +576,6 @@ select{border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-si
 
 .tl-row{background:var(--panel);border:1px solid var(--border);border-radius:var(--r);overflow:hidden;cursor:pointer;transition:border-color .15s;}
 .tl-row:hover{border-color:var(--accent);}
-.tl-row.block{border-left:4px solid var(--block);}
 .tl-row.warn{border-left:4px solid var(--warn);}
 .tl-row.allow{border-left:4px solid var(--allow);}
 .tl-head{display:flex;align-items:center;gap:10px;padding:10px 14px;flex-wrap:wrap;}
@@ -550,6 +651,181 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
   .ag-grid{grid-template-columns:1fr;}
   nav.tabs .tab-btn{padding:0 10px;font-size:12px;}
 }
+
+/* ── 새 개요 레이아웃 ── */
+.ov-new-wrap{padding:16px;display:flex;flex-direction:column;gap:16px;}
+.ov-section{}
+.afc-empty{padding:24px;text-align:center;color:var(--muted);font-size:13px;}
+
+/* 3-에이전트 병렬 그리드 */
+.agent-flows-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;padding:16px;}
+@media(max-width:900px){.agent-flows-grid{grid-template-columns:1fr;}}
+
+/* 에이전트 컬럼 */
+.afc-col{border:2px solid var(--border);border-radius:var(--r);overflow:hidden;background:#fff;}
+.afc-col.warn{border-color:#fcd34d;}
+.afc-col.allow{border-color:#6ee7b7;}
+.afc-col.idle{border-color:var(--border);}
+.afc-header{display:flex;align-items:center;gap:10px;padding:12px 14px;background:var(--bg);border-bottom:1px solid var(--border);}
+.afc-icon{font-size:20px;line-height:1;}
+.afc-name{font-size:13px;font-weight:700;color:var(--ink);}
+.afc-sub{font-size:11px;color:var(--muted);margin-top:1px;}
+.afc-status{margin-left:auto;flex-shrink:0;}
+.afc-pipeline{padding:14px 12px;display:flex;flex-direction:column;align-items:stretch;gap:0;}
+.afc-meta{padding:8px 14px;font-size:11px;color:var(--muted);border-top:1px solid var(--border);background:var(--bg);}
+
+/* 파이프라인 노드 */
+.pf-node{border:1.5px solid var(--border);border-radius:8px;padding:10px 12px;background:#fff;position:relative;}
+.pf-node.allow{border-color:#6ee7b7;background:#f0fdf4;}
+.pf-node.warn{border-color:#fcd34d;background:#fffbeb;}
+.pf-node.block{border-color:#fca5a5;background:#fff1f2;}
+.pf-node.idle{border-color:var(--border);background:#f8fafc;opacity:.55;}
+.pf-node-top{display:flex;align-items:center;gap:6px;margin-bottom:4px;}
+.pf-node-icon{font-size:14px;}
+.pf-node-label{font-size:12px;font-weight:600;color:var(--ink);flex:1;}
+.pf-text{font-size:11px;color:var(--muted);margin-top:3px;word-break:break-all;}
+.pf-text code{font-size:10px;background:transparent;}
+.pf-block-detail{margin-top:6px;padding:6px 8px;background:#fee2e2;border-radius:5px;font-size:11px;}
+.pf-block-detail code{font-size:10px;color:#b91c1c;font-weight:700;}
+.pf-rationale{margin-top:2px;color:#991b1b;font-size:10px;line-height:1.4;}
+.pf-arrow{text-align:center;color:#94a3b8;font-size:16px;line-height:1;padding:3px 0;}
+
+/* Vision 파이프라인 */
+.vision-flow-wrap{display:flex;align-items:flex-start;gap:0;padding:16px;overflow-x:auto;}
+.vf-stage{display:flex;flex-direction:column;align-items:center;min-width:150px;}
+.vf-node{border:2px solid var(--border);border-radius:10px;padding:12px 14px;background:#fff;text-align:center;width:140px;}
+.vf-node.block{border-color:#fca5a5;background:#fff1f2;}
+.vf-node.allow{border-color:#6ee7b7;background:#f0fdf4;}
+.vf-node-icon{font-size:22px;margin-bottom:4px;}
+.vf-node-label{font-size:12px;font-weight:600;color:var(--ink);}
+.vf-node-detail{font-size:10px;color:var(--muted);margin-top:3px;line-height:1.4;}
+.vf-connector{display:flex;align-items:center;padding:0 4px;color:#94a3b8;font-size:18px;margin-top:20px;}
+.vf-hidden-prompts{margin-top:12px;padding:10px 14px;background:#fdf2f8;border:1px solid #f0abfc;border-radius:8px;font-size:11px;}
+.vf-hidden-prompts strong{color:#7c3aed;display:block;margin-bottom:4px;}
+.vf-hidden-prompts code{font-size:10px;color:#6b21a8;display:block;margin-top:2px;word-break:break-all;}
+.vf-empty{padding:20px 16px;color:var(--muted);font-size:12px;}
+
+/* 알림 행 */
+.ov-alerts-row{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;}
+@media(max-width:900px){.ov-alerts-row{grid-template-columns:1fr;}}
+.ov-alerts-row .side-sec{background:var(--panel);border:1px solid var(--border);border-radius:var(--r);}
+.ov-alerts-row .side-hd{font-size:12px;font-weight:700;padding:10px 14px;border-bottom:1px solid var(--border);}
+.ov-alerts-row .side-bd{padding:8px;max-height:220px;overflow-y:auto;}
+
+/* ── Safety Score 게이지 ── */
+.risk-gauge{display:flex;flex-direction:column;align-items:center;padding:8px 24px;border-right:2px solid var(--border);min-width:100px;}
+.gauge-ring{width:52px;height:52px;border-radius:50%;display:flex;align-items:center;justify-content:center;position:relative;}
+.gauge-ring::after{content:'';width:38px;height:38px;border-radius:50%;background:var(--panel);position:absolute;}
+.gauge-score{position:relative;z-index:1;font-size:16px;font-weight:900;line-height:1;}
+.gauge-label{font-size:10px;text-transform:uppercase;letter-spacing:.06em;margin-top:4px;font-weight:700;}
+.gauge-safe{color:var(--allow);}.gauge-caution{color:var(--warn);}.gauge-danger{color:var(--block);}.gauge-critical{color:#7f1d1d;}
+
+/* ── 토스트 알림 ── */
+#toast-container{position:fixed;top:66px;right:16px;z-index:200;display:flex;flex-direction:column;gap:8px;pointer-events:none;max-width:400px;}
+.toast{pointer-events:auto;background:#fff;border:2px solid var(--border);border-radius:10px;padding:14px 18px;box-shadow:0 8px 24px rgba(0,0,0,.12);animation:toast-in .3s ease-out,toast-out .3s ease-in 4.7s forwards;display:flex;align-items:flex-start;gap:12px;}
+.toast.block{border-color:var(--block);background:linear-gradient(135deg,#fef2f2,#fff);}
+.toast.warn{border-color:var(--warn);background:linear-gradient(135deg,#fffbeb,#fff);}
+.toast-icon{font-size:24px;flex-shrink:0;}
+.toast-body{flex:1;}
+.toast-title{font-size:13px;font-weight:800;}
+.toast-title.block{color:var(--block);}.toast-title.warn{color:var(--warn);}
+.toast-detail{font-size:11px;color:var(--muted);margin-top:4px;line-height:1.4;}
+.toast-severity{font-size:10px;font-weight:800;text-transform:uppercase;padding:2px 6px;border-radius:3px;margin-top:6px;display:inline-block;}
+.toast-severity.critical{background:#fef2f2;color:var(--block);}.toast-severity.high{background:#fef3c7;color:#b45309;}
+.toast-severity.medium{background:#f0fdf4;color:#065f46;}.toast-severity.low{background:#f3f4f6;color:var(--muted);}
+@keyframes toast-in{from{opacity:0;transform:translateX(40px);}to{opacity:1;transform:translateX(0);}}
+@keyframes toast-out{from{opacity:1;}to{opacity:0;transform:translateY(-10px);}}
+
+/* ── 액션 배너 ── */
+.action-banner{display:flex;align-items:center;gap:14px;padding:14px 20px;border-radius:var(--r);font-size:13px;font-weight:600;}
+.action-banner.critical{background:linear-gradient(90deg,#fef2f2,#fff1f2);border:2px solid var(--block);color:#991b1b;}
+.action-banner.warning{background:linear-gradient(90deg,#fffbeb,#fef3c7);border:2px solid var(--warn);color:#92400e;}
+.action-banner.safe{background:linear-gradient(90deg,#f0fdf4,#ecfdf5);border:1px solid var(--allow);color:#065f46;}
+.action-banner-icon{font-size:24px;flex-shrink:0;}
+.action-banner-text{flex:1;}
+.action-banner-actions{display:flex;gap:8px;}
+.action-banner-btn{padding:6px 14px;border-radius:6px;border:none;font-size:12px;font-weight:700;cursor:pointer;font-family:inherit;}
+.action-banner-btn.primary{background:var(--block);color:#fff;}.action-banner-btn.primary:hover{background:#b91c1c;}
+.action-banner-btn.secondary{background:#fff;border:1px solid var(--border);color:var(--ink);}
+
+/* ── 히스토리 에이전트 서브탭 ── */
+.hist-agent-tabs{display:flex;gap:4px;background:var(--panel);border:1px solid var(--border);border-radius:var(--r);padding:6px;margin-bottom:12px;}
+.hist-agent-tab{padding:8px 16px;border:none;background:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;color:var(--muted);transition:all .15s;font-family:inherit;}
+.hist-agent-tab:hover{background:#f1f5f9;color:var(--ink);}
+.hist-agent-tab.active{background:var(--accent);color:#fff;}
+.hist-agent-summary{display:flex;align-items:center;gap:16px;background:var(--panel);border:1px solid var(--border);border-radius:var(--r);padding:16px 20px;margin-bottom:14px;}
+.has-icon{font-size:32px;}
+.has-info{flex:1;}
+.has-name{font-size:16px;font-weight:800;}
+.has-stats{display:flex;gap:20px;margin-top:8px;}
+.has-stat{text-align:center;}
+.has-stat-val{font-size:22px;font-weight:800;line-height:1;}
+.has-stat-val.block{color:var(--block);}.has-stat-val.warn{color:var(--warn);}.has-stat-val.allow{color:var(--allow);}
+.has-stat-lbl{font-size:10px;color:var(--muted);text-transform:uppercase;margin-top:2px;}
+.has-rate{display:flex;flex-direction:column;align-items:center;padding:8px 16px;border-left:2px solid var(--border);margin-left:auto;}
+.has-rate-val{font-size:28px;font-weight:900;}.has-rate-lbl{font-size:10px;color:var(--muted);text-transform:uppercase;}
+.has-rules{margin-top:8px;font-size:11px;color:var(--muted);}
+.has-rules code{font-size:10px;background:#f3f4f6;padding:1px 4px;border-radius:3px;}
+
+/* ── 시간 그룹 ── */
+.tl-group-header{display:flex;align-items:center;gap:10px;padding:8px 14px;margin:14px 0 6px;font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;border-bottom:1px solid var(--border);}
+.tl-group-blocks{color:var(--block);font-weight:800;}
+.tl-group-warns{color:var(--warn);font-weight:800;margin-left:4px;}
+
+/* ── block 강조 ── */
+.tl-row.block{border-left:4px solid var(--block);background:#fef2f2;}
+.tl-row.block .tl-head{background:linear-gradient(90deg,#fef2f2,transparent 60%);}
+.tl-row.block.recent{animation:block-pulse 2s ease-in-out 3;}
+@keyframes block-pulse{0%,100%{box-shadow:inset 0 0 0 1px rgba(220,38,38,.15);}50%{box-shadow:inset 0 0 0 2px rgba(220,38,38,.4),0 0 12px rgba(220,38,38,.1);}}
+
+/* ── 에이전트 상세 확장 패널 ── */
+.agent-detail-panel{grid-column:1/-1;background:var(--panel);border:2px solid var(--accent);border-radius:var(--r);padding:20px;animation:adp-slide .25s ease-out;}
+@keyframes adp-slide{from{opacity:0;max-height:0;}to{opacity:1;max-height:800px;}}
+.adp-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;}
+.adp-header h3{font-size:14px;font-weight:800;}
+.adp-close{border:none;background:none;font-size:18px;cursor:pointer;color:var(--muted);padding:4px 8px;}
+.adp-close:hover{color:var(--ink);}
+.adp-stats-row{display:flex;gap:24px;margin-bottom:16px;padding:12px 0;border-bottom:1px solid var(--border);}
+.adp-stat{text-align:center;min-width:60px;}
+.adp-stat-val{font-size:28px;font-weight:800;}
+.adp-stat-lbl{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;}
+.adp-section{margin-top:16px;}
+.adp-section h4{font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:8px;}
+.rule-bar{display:flex;align-items:center;gap:8px;margin-bottom:6px;font-size:11px;}
+.rule-bar-fill{height:14px;border-radius:3px;background:var(--block);min-width:4px;}
+.rule-bar code{font-size:10px;color:var(--muted);}
+.surf-bar-wrap{height:18px;border-radius:4px;overflow:hidden;display:flex;background:#f3f4f6;}
+.surf-bar-seg{height:100%;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;color:#fff;min-width:20px;}
+.adp-events{max-height:260px;overflow-y:auto;display:flex;flex-direction:column;gap:4px;margin-top:8px;}
+
+/* ── 에이전트 컬럼 block 글로우 ── */
+.afc-col.block{border-color:#fca5a5;animation:afc-block-glow 2s ease-in-out infinite;}
+@keyframes afc-block-glow{0%,100%{box-shadow:0 0 0 0 rgba(220,38,38,0);}50%{box-shadow:0 0 16px 4px rgba(220,38,38,.15);}}
+.afc-col{cursor:pointer;transition:transform .1s,box-shadow .15s;}
+.afc-col:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,.08);}
+.afc-mini-stats{display:flex;gap:8px;font-size:11px;font-weight:800;margin-top:4px;}
+
+/* ── 히스토리 에이전트 3분할 ── */
+.hist-agent-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;}
+@media(max-width:1000px){.hist-agent-grid{grid-template-columns:1fr;}}
+.hist-agent-col{background:var(--panel);border:1px solid var(--border);border-radius:var(--r);overflow:hidden;display:flex;flex-direction:column;}
+.hist-agent-col.has-block{border-color:#fca5a5;}
+.hist-agent-col.has-warn{border-color:#fcd34d;}
+.hac-header{padding:12px 14px;border-bottom:1px solid var(--border);background:var(--bg);display:flex;align-items:center;gap:10px;}
+.hac-icon{font-size:22px;}
+.hac-info{flex:1;}
+.hac-name{font-size:13px;font-weight:800;}
+.hac-sub{font-size:10px;color:var(--muted);}
+.hac-stats{display:flex;gap:6px;align-items:center;}
+.hac-stat{text-align:center;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:800;line-height:1.3;}
+.hac-stat.block{background:#fef2f2;color:var(--block);}.hac-stat.warn{background:#fffbeb;color:var(--warn);}.hac-stat.allow{background:#f0fdf4;color:var(--allow);}
+.hac-stat-n{font-size:16px;display:block;}
+.hac-body{flex:1;overflow-y:auto;max-height:500px;padding:6px;}
+.hac-body .tl-row{margin-bottom:4px;}
+.hac-empty{padding:32px 16px;text-align:center;color:var(--muted);font-size:12px;}
+.hac-footer{padding:8px 14px;border-top:1px solid var(--border);text-align:center;}
+.hac-footer button{border:none;background:none;color:var(--accent);font-size:11px;font-weight:700;cursor:pointer;font-family:inherit;padding:4px 8px;border-radius:4px;}
+.hac-footer button:hover{background:#eef2ff;}
 </style>
 </head>
 <body>
@@ -575,28 +851,36 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
 </header>
 
 <div id="metrics-bar"></div>
+<div id="toast-container"></div>
 
 <!-- 개요 -->
 <div class="tab-panel active" id="panel-overview">
-  <div class="ov-wrap">
-    <div class="ov-main">
-      <div class="panel">
-        <div class="panel-hd"><h2>에이전트 파이프라인</h2></div>
-        <div class="graph-scroll">
-          <svg class="graph" viewBox="0 0 960 310" aria-label="에이전트 파이프라인 그래프">
-            <defs>
-              <marker id="arr" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
-                <path d="M0,0 L0,6 L9,3 z" fill="#cbd5e1"/>
-              </marker>
-            </defs>
-            <g id="g-edges"></g>
-            <g id="g-nodes"></g>
-          </svg>
-        </div>
-        <div class="ag-grid" id="ag-cards"></div>
+  <div class="ov-new-wrap">
+
+    <div id="action-banner" style="display:none;"></div>
+
+    <!-- LLM 에이전트 파이프라인 -->
+    <div class="panel ov-section">
+      <div class="panel-hd">
+        <h2>🤖 LLM 에이전트 파이프라인 <span style="font-size:12px;font-weight:400;color:var(--muted);">3개 에이전트 병렬 실행</span></h2>
+      </div>
+      <div id="agent-flows" class="agent-flows-grid">
+        <div class="afc-empty">에이전트를 실행하면 여기에 파이프라인이 표시됩니다.</div>
       </div>
     </div>
-    <div class="ov-side">
+
+    <!-- Vision 탐지 파이프라인 -->
+    <div class="panel ov-section">
+      <div class="panel-hd">
+        <h2>👁 Vision 이미지 탐지 파이프라인 <span style="font-size:12px;font-weight:400;color:var(--muted);">이미지 삽입 시 자동 탐지</span></h2>
+      </div>
+      <div id="vision-flow">
+        <div class="afc-empty"><code>node src/cli.js scan-image --file &lt;이미지경로&gt;</code> 실행 시 탐지 결과가 표시됩니다.</div>
+      </div>
+    </div>
+
+    <!-- 사이드 알림 -->
+    <div class="ov-alerts-row">
       <div class="side-sec inject-sec" id="disc-sec">
         <div class="side-hd inject-hd">프롬프트 인젝션 탐지</div>
         <div class="side-bd" id="disc-list"></div>
@@ -610,12 +894,20 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
         <div class="side-bd" id="feed-list"></div>
       </div>
     </div>
+
   </div>
 </div>
 
 <!-- 히스토리 -->
 <div class="tab-panel" id="panel-history">
   <div class="hist-wrap">
+    <div class="hist-agent-tabs" id="hist-agent-tabs">
+      <button class="hist-agent-tab active" data-agent="">전체 타임라인</button>
+      <button class="hist-agent-tab" data-agent="agent-qa">🔍 QA Agent</button>
+      <button class="hist-agent-tab" data-agent="agent-backend">⚙️ Backend Agent</button>
+      <button class="hist-agent-tab" data-agent="agent-security">🛡 Security Agent</button>
+    </div>
+    <div class="hist-agent-summary" id="hist-agent-summary" style="display:none;"></div>
     <div class="hist-toolbar">
       <div class="tb-grp">
         <label>판정</label>
@@ -635,6 +927,15 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
           <option value="command">command</option>
           <option value="output">output</option>
           <option value="llm">llm</option>
+        </select>
+      </div>
+      <div class="tb-grp">
+        <label>에이전트</label>
+        <select id="f-agent">
+          <option value="">전체</option>
+          <option value="agent-qa">QA 에이전트</option>
+          <option value="agent-backend">Backend 에이전트</option>
+          <option value="agent-security">Security 에이전트</option>
         </select>
       </div>
       <span class="tb-count" id="hist-count"></span>
@@ -657,10 +958,14 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:
 // ── 상태 ──────────────────────────────────────────────────────────────────────
 let lastModel = null;
 let activeTab = 'overview';
+let historyAgentFilter = '';
+let seenEventIds = new Set();
 
 const ST_LABEL = { idle:'대기', allow:'허용', warn:'경고', block:'차단' };
 const ST_EN    = { idle:'IDLE', allow:'ALLOW', warn:'WARN', block:'BLOCK' };
 const SEV_CLS  = { critical:'critical', high:'high', medium:'medium', low:'low' };
+const AGENT_LABEL = {'agent-qa':'QA','agent-backend':'Backend','agent-security':'Security'};
+const SURF_COLORS = {prompt:'#2563eb',command:'#d97706',output:'#059669',llm:'#0891b2',image:'#7c3aed'};
 
 function h(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function fmt(v){return v?new Date(v).toLocaleTimeString('ko-KR',{hour12:false}):'—';}
@@ -670,68 +975,136 @@ function bdg(s){return '<span class="badge badge-'+h(s)+'">'+h(s)+'</span>';}
 function sevPill(s){return '<span class="sev '+h(SEV_CLS[s]||'low')+'">'+h(s)+'</span>';}
 
 // ── 탭 전환 ───────────────────────────────────────────────────────────────────
-document.getElementById('tab-nav').addEventListener('click',e=>{
-  const btn=e.target.closest('.tab-btn');
-  if(!btn)return;
-  activeTab=btn.dataset.tab;
+function switchToTab(tab){
+  activeTab=tab;
   document.querySelectorAll('.tab-btn').forEach(b=>b.classList.toggle('active',b.dataset.tab===activeTab));
   document.querySelectorAll('.tab-panel').forEach(p=>p.classList.toggle('active',p.id==='panel-'+activeTab));
   if(lastModel)renderAll(lastModel);
+}
+document.getElementById('tab-nav').addEventListener('click',e=>{
+  const btn=e.target.closest('.tab-btn');
+  if(!btn)return;
+  switchToTab(btn.dataset.tab);
 });
 
-document.getElementById('f-dec').addEventListener('change',()=>{if(lastModel)renderHistory(lastModel.events);});
-document.getElementById('f-surf').addEventListener('change',()=>{if(lastModel)renderHistory(lastModel.events);});
+document.getElementById('f-dec').addEventListener('change',()=>{if(lastModel)renderHistory(lastModel);});
+document.getElementById('f-surf').addEventListener('change',()=>{if(lastModel)renderHistory(lastModel);});
+document.getElementById('f-agent').addEventListener('change',()=>{if(lastModel)renderHistory(lastModel);});
 document.addEventListener('click',e=>{const r=e.target.closest('.tl-row');if(r)r.classList.toggle('open');});
 
-// ── 지표 ─────────────────────────────────────────────────────────────────────
-function renderMetrics(c){
+// ── 히스토리 에이전트 서브탭 ───────────────────────────────────────────────────
+document.getElementById('hist-agent-tabs').addEventListener('click',e=>{
+  const btn=e.target.closest('.hist-agent-tab');
+  if(!btn)return;
+  historyAgentFilter=btn.dataset.agent;
+  document.querySelectorAll('.hist-agent-tab').forEach(b=>b.classList.toggle('active',b.dataset.agent===historyAgentFilter));
+  document.getElementById('f-agent').value=historyAgentFilter;
+  if(lastModel)renderHistory(lastModel);
+});
+
+// ── 에이전트 상세 클릭 ────────────────────────────────────────────────────────
+document.addEventListener('click',e=>{
+  const col=e.target.closest('.afc-col[data-agent-id]');
+  if(col){toggleAgentDetail(col.dataset.agentId);return;}
+  const closeBtn=e.target.closest('.adp-close');
+  if(closeBtn){const panel=closeBtn.closest('.agent-detail-panel');if(panel)panel.remove();return;}
+  const bannerBtn=e.target.closest('.action-banner-btn');
+  if(bannerBtn&&bannerBtn.dataset.tab){switchToTab(bannerBtn.dataset.tab);}
+});
+
+// ── 지표 + 게이지 ───────────────────────────────────────────────────────────────
+function renderMetrics(c, ss){
+  ss=ss||{score:100,level:'safe',label:'안전'};
+  const gaugeColor=ss.level==='safe'?'var(--allow)':ss.level==='caution'?'var(--warn)':'var(--block)';
+  const gaugeHtml='<div class="risk-gauge gauge-'+ss.level+'" style="--gauge-pct:'+ss.score+'">'+
+    '<div class="gauge-ring" style="background:conic-gradient('+gaugeColor+' '+ss.score+'%,#e5e7eb '+ss.score+'%);">'+
+      '<span class="gauge-score" style="color:'+gaugeColor+'">'+ss.score+'</span>'+
+    '</div>'+
+    '<span class="gauge-label" style="color:'+gaugeColor+'">'+h(ss.label)+'</span>'+
+  '</div>';
   const items=[['전체',c.total,''],['차단',c.block,'m-block'],['경고',c.warn,'m-warn'],['허용',c.allow,'m-allow'],['룰 후보',c.candidates,''],['숨겨진 프롬프트',c.hiddenPrompts,'m-inject']];
-  document.getElementById('metrics-bar').innerHTML=items.map(([l,v,cl])=>'<div class="metric '+cl+'"><strong>'+v+'</strong><span>'+l+'</span></div>').join('');
+  document.getElementById('metrics-bar').innerHTML=gaugeHtml+items.map(([l,v,cl])=>'<div class="metric '+cl+'"><strong>'+v+'</strong><span>'+l+'</span></div>').join('');
 }
 
-// ── 에이전트 그래프 ───────────────────────────────────────────────────────────
-function renderGraph(model){
-  const byId=new Map(model.agents.map(a=>[a.id,a]));
-  const W=165,H=90;
-  document.getElementById('g-edges').innerHTML=model.edges.map(({from:fId,to:tId})=>{
-    const from=byId.get(fId),to=byId.get(tId);
-    const x1=from.x+W,y1=from.y+H/2,x2=to.x,y2=to.y+H/2;
-    const cx1=x1+45,cx2=x2-45;
-    const st=from.status;
-    const cls=st==='block'?'g-edge block-e':st==='warn'?'g-edge warn-e':st!=='idle'?'g-edge active':'g-edge';
-    return '<path class="'+cls+'" d="M'+x1+','+y1+' C'+cx1+','+y1+' '+cx2+','+y2+' '+x2+','+y2+'"/>';
-  }).join('');
-  document.getElementById('g-nodes').innerHTML=model.agents.map(a=>{
-    const st=a.status;
-    return '<g class="g-node '+st+'" transform="translate('+a.x+','+a.y+')">' +
-      '<rect width="'+W+'" height="'+H+'" rx="10"/>' +
-      '<circle class="g-ind '+st+'" cx="'+(W-14)+'" cy="14" r="6"/>' +
-      '<text x="13" y="32" font-size="16">'+h(a.icon)+'</text>' +
-      '<text x="36" y="31" font-size="13" font-weight="800">'+h(a.label)+'</text>' +
-      '<text class="g-role" x="13" y="50">'+h(a.role)+'</text>' +
-      '<text class="g-st '+st+'" x="13" y="68">'+ST_EN[st]+' · '+a.eventCount+'건</text>' +
-      '<text x="13" y="83" font-size="10" fill="#94a3b8">'+h((a.currentTask||'').slice(0,22))+'</text>' +
-    '</g>';
-  }).join('');
-}
-
-// ── 에이전트 카드 ─────────────────────────────────────────────────────────────
-function renderAgentCards(agents){
-  document.getElementById('ag-cards').innerHTML=agents.map(a=>{
-    const recHtml=(a.recentEvents||[]).map(e=>
-      '<div class="ag-rec">'+bdg(surf(e))+
-      '<span class="pill sm '+e.decision+'">'+ST_LABEL[e.decision]||e.decision+'</span>'+
-      '<code>'+h((e.event?.text??e.text??'').slice(0,28))+'</code></div>'
-    ).join('');
-    return '<div class="ag-card '+a.status+'">' +
-      '<div class="ag-card-top"><span class="ag-icon">'+h(a.icon)+'</span><span class="pill '+a.status+'">'+ST_LABEL[a.status]+'</span></div>' +
-      '<div class="ag-name">'+h(a.label)+'</div>' +
-      '<div class="ag-role">'+h(a.role)+'</div>' +
-      '<div class="ag-task">'+h(a.currentTask)+'</div>' +
-      '<div class="ag-meta">처리: '+a.eventCount+'건 · 최근: '+fmt(a.lastSeen)+'</div>' +
-      (recHtml?'<div class="ag-recents">'+recHtml+'</div>':'') +
+// ── LLM 에이전트 3개 병렬 파이프라인 ─────────────────────────────────────────
+const ROLE_META={
+  qa:      {label:'Agent 1 · QA',       icon:'🔍', sub:'Frontend / Design QA'},
+  backend: {label:'Agent 2 · Backend',   icon:'⚙️',  sub:'Backend / Integration'},
+  security:{label:'Agent 3 · Security',  icon:'🛡',  sub:'Security / Analyst'}
+};
+const STAGE_META={
+  prompt: {icon:'📝', label:'Prompt 스캔'},
+  llm:    {icon:'🤖', label:'LLM 핸드오프'},
+  command:{icon:'⚡', label:'Command 실행'},
+  output: {icon:'📤', label:'Output 검사'}
+};
+function renderAgentFlows(model){
+  const flows=model.agentFlows||[];
+  const stats=model.agentStats||[];
+  if(!flows.length){return;}
+  document.getElementById('agent-flows').innerHTML=flows.map(flow=>{
+    const m=ROLE_META[flow.role]||{label:flow.role,icon:'🤖',sub:''};
+    const od=flow.overallDecision||'idle';
+    const st=stats.find(s=>s.role===flow.role)||{block:0,warn:0};
+    const miniStats=(st.block>0?'<span style="color:var(--block);">'+st.block+' 차단</span>':'')+
+                    (st.warn>0?'<span style="color:var(--warn);">'+st.warn+' 경고</span>':'');
+    const stagesHtml=flow.stages.map((stage,i)=>{
+      const sm=STAGE_META[stage.surface]||{icon:'•',label:stage.surface};
+      const isBlock=stage.decision==='block';
+      const ruleId=isBlock&&stage.findings[0]?.id?stage.findings[0].id:'';
+      const rationale=isBlock&&stage.findings[0]?.rationale?stage.findings[0].rationale.slice(0,55):'';
+      const sevLabel=isBlock&&stage.findings[0]?.severity?sevPill(stage.findings[0].severity):'';
+      return (i>0?'<div class="pf-arrow">↓</div>':'')+
+        '<div class="pf-node '+stage.decision+'">'+
+          '<div class="pf-node-top">'+
+            '<span class="pf-node-icon">'+sm.icon+'</span>'+
+            '<span class="pf-node-label">'+h(sm.label)+'</span>'+
+            '<span class="pill sm '+stage.decision+'">'+ST_LABEL[stage.decision]+'</span>'+
+            sevLabel+
+          '</div>'+
+          (stage.text?'<div class="pf-text"><code>'+h(stage.text.slice(0,45))+'</code></div>':'')+
+          (isBlock?'<div class="pf-block-detail"><code>'+h(ruleId)+'</code><div class="pf-rationale">'+h(rationale)+'</div></div>':'')+
+        '</div>';
+    }).join('');
+    return '<div class="afc-col '+od+'" data-agent-id="'+flow.agentId+'">'+
+      '<div class="afc-header">'+
+        '<span class="afc-icon">'+m.icon+'</span>'+
+        '<div><div class="afc-name">'+h(m.label)+'</div><div class="afc-sub">'+h(m.sub)+'</div>'+(miniStats?'<div class="afc-mini-stats">'+miniStats+'</div>':'')+'</div>'+
+        '<span class="afc-status pill '+od+'">'+ST_LABEL[od]+'</span>'+
+      '</div>'+
+      '<div class="afc-pipeline">'+(stagesHtml||'<div class="afc-empty" style="padding:20px;font-size:12px;">미실행</div>')+'</div>'+
+      '<div class="afc-meta">이벤트 '+flow.eventCount+'건 · '+(flow.lastSeen?fmt(flow.lastSeen):'미실행')+'</div>'+
     '</div>';
   }).join('');
+}
+
+// ── Vision 이미지 탐지 파이프라인 ─────────────────────────────────────────────
+function renderVisionFlow(model){
+  const vf=model.visionFlow;
+  const el=document.getElementById('vision-flow');
+  if(!vf){el.innerHTML='<div class="vf-empty"><code>node src/cli.js scan-image --file &lt;이미지경로&gt;</code> 실행 시 탐지 결과가 표시됩니다. 데모: <code>npm run demo:image</code> → <code>node src/cli.js scan-image --file examples/generated/attack-image.svg</code></div>';return;}
+  const stages=[
+    {icon:'🖼',label:'이미지 업로드',detail:vf.imagePath?vf.imagePath.split('/').at(-1):'파일 없음',cls:''},
+    {icon:'👁',label:'OCR / VLM 분석',detail:'신뢰도: '+(vf.confidence!=null?(vf.confidence*100).toFixed(0)+'%':'—')+(vf.hiddenPrompts.length?' · 숨겨진 텍스트 '+(vf.hiddenPrompts.length)+'건':''),cls:vf.hiddenPrompts.length?'block':'allow'},
+    {icon:'🛡',label:'룰베이스 검사',detail:(vf.findings[0]?.id||'규칙 적용 완료'),cls:vf.decision},
+    {icon:vf.decision==='block'?'🚫':'✅',label:vf.decision==='block'?'차단':'허용',detail:vf.findings[0]?.rationale?.slice(0,50)||'',cls:vf.decision}
+  ];
+  const stagesHtml=stages.map((s,i)=>
+    (i>0?'<div class="vf-connector">→</div>':'')+
+    '<div class="vf-stage">'+
+      '<div class="vf-node '+s.cls+'">'+
+        '<div class="vf-node-icon">'+s.icon+'</div>'+
+        '<div class="vf-node-label">'+h(s.label)+'</div>'+
+        '<div class="vf-node-detail">'+h(s.detail)+'</div>'+
+      '</div>'+
+    '</div>'
+  ).join('');
+  const promptsHtml=vf.hiddenPrompts.length?
+    '<div class="vf-hidden-prompts"><strong>🔴 숨겨진 프롬프트 인젝션 ('+(vf.hiddenPrompts.length)+'건 발견)</strong>'+
+    vf.hiddenPrompts.map(p=>'<code>'+h(p.slice(0,80))+'</code>').join('')+'</div>':'';
+  const extractedHtml=vf.extractedText?
+    '<div style="padding:10px 16px 0;font-size:11px;color:var(--muted);">추출 텍스트: <code style="font-size:10px;">'+h(vf.extractedText.slice(0,100))+'</code></div>':'';
+  el.innerHTML='<div class="vision-flow-wrap">'+stagesHtml+'</div>'+promptsHtml+extractedHtml;
 }
 
 // ── 인젝션 탐지 사이드바 ──────────────────────────────────────────────────────
@@ -758,22 +1131,140 @@ function renderFeed(events){
 }
 
 // ── 히스토리 탭 ───────────────────────────────────────────────────────────────
-function renderHistory(events){
+function groupByTimeWindow(events,windowMin){
+  windowMin=windowMin||30;
+  const groups=[];let cur=null;
+  for(const e of events){
+    const ts=Date.parse(e.timestamp??e.scannedAt??'');
+    if(!cur||cur.start-ts>windowMin*60000){cur={start:ts,end:ts,events:[e]};groups.push(cur);}
+    else{cur.events.push(e);cur.end=ts;}
+  }
+  return groups;
+}
+
+function renderAgentSummaryHeader(agentId,events){
+  const el=document.getElementById('hist-agent-summary');
+  if(!agentId){el.style.display='none';return;}
+  const ae=events.filter(e=>(e.event?.agentId??'')===agentId);
+  const bk=ae.filter(e=>e.decision==='block').length;
+  const wn=ae.filter(e=>e.decision==='warn').length;
+  const al=ae.filter(e=>e.decision==='allow').length;
+  const rate=ae.length?((bk/ae.length)*100).toFixed(0):'0';
+  const ruleFreq={};
+  for(const e of ae.filter(e=>e.decision==='block')){for(const f of(e.findings??[])){ruleFreq[f.id]=(ruleFreq[f.id]??0)+1;}}
+  const topRules=Object.entries(ruleFreq).sort((a,b)=>b[1]-a[1]).slice(0,3);
+  const role=agentId.replace('agent-','');
+  const m=ROLE_META[role]||{icon:'🤖',label:agentId,sub:''};
+  el.style.display='flex';
+  el.innerHTML='<div class="has-icon">'+m.icon+'</div>'+
+    '<div class="has-info"><div class="has-name">'+h(m.label)+' <span style="font-size:12px;font-weight:400;color:var(--muted);">'+h(m.sub)+'</span></div>'+
+      '<div class="has-stats">'+
+        '<div class="has-stat"><div class="has-stat-val block">'+bk+'</div><div class="has-stat-lbl">차단</div></div>'+
+        '<div class="has-stat"><div class="has-stat-val warn">'+wn+'</div><div class="has-stat-lbl">경고</div></div>'+
+        '<div class="has-stat"><div class="has-stat-val allow">'+al+'</div><div class="has-stat-lbl">허용</div></div>'+
+      '</div>'+
+      (topRules.length?'<div class="has-rules">주요 룰: '+topRules.map(([r,n])=>'<code>'+h(r)+'</code>('+n+')').join(' · ')+'</div>':'')+
+    '</div>'+
+    '<div class="has-rate"><div class="has-rate-val" style="color:'+(bk>0?'var(--block)':'var(--allow)')+'">'+rate+'%</div><div class="has-rate-lbl">차단율</div></div>';
+}
+
+function renderEventRow(e,now){
+  const d=e.decision||'allow',s=surf(e);
+  const aid=e.event?.agentId??'';
+  const aLbl=AGENT_LABEL[aid]??aid;
+  const agentBdg=aid?'<span class="badge badge-agent" title="'+h(aid)+'">'+h(aLbl)+'</span>':'';
+  const recent=d==='block'&&(now-Date.parse(e.timestamp??''))<30000;
+  const txt=(e.event?.text??e.text??'').slice(0,100);
+  const findings=e.findings??[];
+  const topSev=findings[0]?.severity;
+  const sevBdg=topSev&&d==='block'?sevPill(topSev):'';
+  const hPrompts=e.event?.evidence?.hiddenPrompts??[];
+  const fRows=findings.map(f=>'<div class="tl-finding">'+sevPill(f.severity)+'<strong>'+h(f.id)+'</strong><span style="color:var(--muted);">'+h(f.rationale||'')+'</span></div>').join('');
+  const injSec=hPrompts.length?'<div class="tl-inject"><strong>숨겨진 프롬프트 원문 ('+hPrompts.length+'건)</strong>'+hPrompts.map(p=>'<code>'+h(p)+'</code>').join('<br>')+'</div>':'';
+  return '<div class="tl-row '+d+(recent?' recent':'')+'"><div class="tl-head"><span class="tl-ts">'+fmt(e.timestamp??e.recordedAt)+'</span><span class="tl-dec '+d+'">'+ST_LABEL[d]+'</span>'+sevBdg+bdg(s)+agentBdg+'<span class="tl-txt"><code>'+h(txt)+'</code></span><span class="tl-cnt">발견 '+findings.length+'건</span></div><div class="tl-detail"><div class="tl-detail-hd"><strong>이벤트 ID:</strong> '+h(e.id||'—')+' · <strong>에이전트:</strong> '+h(aid||'—')+' · <strong>시각:</strong> '+fmtFull(e.timestamp)+(e.event?.evidence?.imagePath?' · <strong>이미지:</strong> '+h(e.event.evidence.imagePath):'')+'</div>'+(fRows?'<div class="finding-list">'+fRows+'</div>':'')+injSec+'</div></div>';
+}
+
+function renderAgentColumn(agentId,events,now,maxRows){
+  const role=agentId.replace('agent-','');
+  const m=ROLE_META[role]||{icon:'🤖',label:agentId,sub:''};
+  const ae=events.filter(e=>(e.event?.agentId??'')===agentId);
+  const bk=ae.filter(e=>e.decision==='block').length;
+  const wn=ae.filter(e=>e.decision==='warn').length;
+  const al=ae.filter(e=>e.decision==='allow').length;
+  const borderCls=bk>0?'has-block':wn>0?'has-warn':'';
+  const shown=ae.slice(0,maxRows||15);
+  const rowsHtml=shown.length
+    ?shown.map(e=>renderEventRow(e,now)).join('')
+    :'<div class="hac-empty">이 에이전트의 이벤트가 없습니다.</div>';
+  const moreBtn=ae.length>shown.length
+    ?'<div class="hac-footer"><button onclick="document.querySelectorAll(\'[data-agent=&quot;'+agentId+'&quot;]\').forEach(b=>b.click())">+'+( ae.length-shown.length)+'건 더 보기</button></div>':'';
+  return '<div class="hist-agent-col '+borderCls+'">'+
+    '<div class="hac-header">'+
+      '<span class="hac-icon">'+m.icon+'</span>'+
+      '<div class="hac-info"><div class="hac-name">'+h(m.label)+'</div><div class="hac-sub">'+h(m.sub)+'</div></div>'+
+      '<div class="hac-stats">'+
+        (bk?'<div class="hac-stat block"><span class="hac-stat-n">'+bk+'</span>차단</div>':'')+
+        (wn?'<div class="hac-stat warn"><span class="hac-stat-n">'+wn+'</span>경고</div>':'')+
+        '<div class="hac-stat allow"><span class="hac-stat-n">'+al+'</span>허용</div>'+
+      '</div>'+
+    '</div>'+
+    '<div class="hac-body">'+rowsHtml+'</div>'+moreBtn+
+  '</div>';
+}
+
+function renderHistory(model){
+  const events=model.events||[];
   const fd=document.getElementById('f-dec').value;
   const fs=document.getElementById('f-surf').value;
-  const filtered=events.filter(e=>(!fd||e.decision===fd)&&(!fs||surf(e)===fs));
+  const fa=document.getElementById('f-agent').value||historyAgentFilter;
+  const now=Date.now();
+
+  const preFiltered=events.filter(e=>(!fd||e.decision===fd)&&(!fs||surf(e)===fs));
+
+  // ── 전체 모드: 에이전트 3분할 컬럼 ──
+  if(!fa){
+    renderAgentSummaryHeader('',events);
+    document.getElementById('hist-count').textContent='총 '+preFiltered.length+'건';
+    const agents=['agent-qa','agent-backend','agent-security'];
+    const unassigned=preFiltered.filter(e=>!agents.includes(e.event?.agentId??''));
+    let html='<div class="hist-agent-grid">'+
+      agents.map(aid=>renderAgentColumn(aid,preFiltered,now,15)).join('')+
+    '</div>';
+    if(unassigned.length){
+      html+='<div style="margin-top:16px;"><div class="tl-group-header"><span>미분류 이벤트</span><span>'+unassigned.length+'건</span></div>';
+      html+=unassigned.map(e=>renderEventRow(e,now)).join('');
+      html+='</div>';
+    }
+    if(!preFiltered.length){
+      html='<div style="text-align:center;padding:48px;color:var(--muted);font-size:13px;">조건에 맞는 이벤트가 없습니다.</div>';
+    }
+    document.getElementById('hist-list').innerHTML=html;
+    return;
+  }
+
+  // ── 특정 에이전트 모드: 요약 헤더 + 시간 그룹 리스트 ──
+  renderAgentSummaryHeader(fa,events);
+  const filtered=preFiltered.filter(e=>(e.event?.agentId??'')===fa);
   document.getElementById('hist-count').textContent='총 '+filtered.length+'건';
-  document.getElementById('hist-list').innerHTML=filtered.length
-    ?filtered.map(e=>{
-        const d=e.decision||'allow',s=surf(e);
-        const txt=(e.event?.text??e.text??'').slice(0,100);
-        const findings=e.findings??[];
-        const hPrompts=e.event?.evidence?.hiddenPrompts??[];
-        const fRows=findings.map(f=>'<div class="tl-finding">'+sevPill(f.severity)+'<strong>'+h(f.id)+'</strong><span style="color:var(--muted);">'+h(f.rationale||'')+'</span></div>').join('');
-        const injSec=hPrompts.length?'<div class="tl-inject"><strong>숨겨진 프롬프트 원문 ('+hPrompts.length+'건)</strong>'+hPrompts.map(p=>'<code>'+h(p)+'</code>').join('<br>')+'</div>':'';
-        return '<div class="tl-row '+d+'"><div class="tl-head"><span class="tl-ts">'+fmt(e.timestamp??e.recordedAt)+'</span><span class="tl-dec '+d+'">'+ST_LABEL[d]+'</span>'+bdg(s)+'<span class="tl-txt"><code>'+h(txt)+'</code></span><span class="tl-cnt">발견 '+findings.length+'건</span></div><div class="tl-detail"><div class="tl-detail-hd"><strong>이벤트 ID:</strong> '+h(e.id||'—')+' · <strong>시각:</strong> '+fmtFull(e.timestamp)+(e.event?.evidence?.imagePath?' · <strong>이미지:</strong> '+h(e.event.evidence.imagePath):'')+'</div>'+(fRows?'<div class="finding-list">'+fRows+'</div>':'')+injSec+'</div></div>';
-      }).join('')
-    :'<div style="text-align:center;padding:48px;color:var(--muted);font-size:13px;">조건에 맞는 이벤트가 없습니다.</div>';
+
+  if(!filtered.length){
+    document.getElementById('hist-list').innerHTML='<div style="text-align:center;padding:48px;color:var(--muted);font-size:13px;">이 에이전트의 이벤트가 없습니다.</div>';
+    return;
+  }
+
+  const groups=groupByTimeWindow(filtered,30);
+  let html='';
+  for(const g of groups){
+    const gBlocks=g.events.filter(e=>e.decision==='block').length;
+    const gWarns=g.events.filter(e=>e.decision==='warn').length;
+    html+='<div class="tl-group-header"><span>'+fmt(new Date(g.start).toISOString())+' ~ '+fmt(new Date(g.end).toISOString())+'</span>'+
+      '<span>'+g.events.length+'건</span>'+
+      (gBlocks?'<span class="tl-group-blocks">'+gBlocks+' 차단</span>':'')+
+      (gWarns?'<span class="tl-group-warns">'+gWarns+' 경고</span>':'')+
+    '</div>';
+    for(const e of g.events){ html+=renderEventRow(e,now); }
+  }
+  document.getElementById('hist-list').innerHTML=html;
 }
 
 // ── 이미지 포렌식 탭 ──────────────────────────────────────────────────────────
@@ -793,7 +1284,7 @@ function renderForensics(model){
       const oBoxes=(item.objects||[]).map(o=>'<div class="bbox obj" style="left:'+((o.x||0)*100)+'%;top:'+((o.y||0)*100)+'%;width:'+((o.width||.1)*100)+'%;height:'+((o.height||.1)*100)+'%;"><span class="bbox-lbl">'+h(o.label||'object')+'</span></div>').join('');
       const injHtml=item.hiddenPrompts?.length?'<div class="inj-banner"><div class="inj-banner-ttl">숨겨진 프롬프트 ('+item.hiddenPrompts.length+'건 발견)</div>'+item.hiddenPrompts.map(p=>'<div class="inj-item"><code>'+h(p)+'</code></div>').join('')+'</div>':'';
       const fHtml=item.findings.map(f=>'<div class="finding-row">'+sevPill(f.severity)+'<strong>'+h(f.id)+'</strong><span style="color:var(--muted);">'+h(f.rationale||'')+'</span></div>').join('');
-      return '<div class="img-card"><div class="img-card-hd"><div style="display:flex;align-items:center;gap:8px;">'+bdg('image')+'<strong>'+h(item.imageId||item.eventId||'이미지 이벤트')+'</strong></div><div style="display:flex;align-items:center;gap:8px;"><span class="pill '+item.decision+'">'+ST_LABEL[item.decision]+'</span><span style="font-size:11px;color:var(--muted);">'+fmtFull(item.timestamp)+'</span></div></div><div class="img-card-bd">'+(iSrc?'<div class="img-frame"><img src="'+h(iSrc)+'" alt="증거 이미지" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'block\'"><div class="img-missing">이미지 파일 없음 — 추출 텍스트로 표시</div>'+rBoxes+oBoxes+'</div>':'<div class="img-frame"><div class="img-missing" style="display:block;">이미지 경로 없음</div></div>')+'<div class="img-info">'+injHtml+(item.extractedText?'<div><span class="lbl-sm">추출 텍스트</span><div class="ocr"><code>'+h(item.extractedText)+'</code></div></div>':'')+(fHtml?'<div><span class="lbl-sm">탐지 결과</span><div class="finding-list">'+fHtml+'</div></div>':'')+'<div style="font-size:11px;color:var(--muted);">해시: <code>'+h((item.imageHash||'').slice(0,16))+'</code> · 신뢰도: '+h(item.confidence??'n/a')+'</div></div></div></div>';
+      return '<div class="img-card"><div class="img-card-hd"><div style="display:flex;align-items:center;gap:8px;">'+bdg('image')+'<strong>'+h(item.imageId||item.eventId||'이미지 이벤트')+'</strong></div><div style="display:flex;align-items:center;gap:8px;"><span class="pill '+item.decision+'">'+ST_LABEL[item.decision]+'</span><span style="font-size:11px;color:var(--muted);">'+fmtFull(item.timestamp)+'</span></div></div><div class="img-card-bd">'+(iSrc?'<div class="img-frame"><img src="'+h(iSrc)+'" alt="증거 이미지" onerror="this.style.display=\\'none\\';this.nextElementSibling.style.display=\\'block\\'"><div class="img-missing">이미지 파일 없음 — 추출 텍스트로 표시</div>'+rBoxes+oBoxes+'</div>':'<div class="img-frame"><div class="img-missing" style="display:block;">이미지 경로 없음</div></div>')+'<div class="img-info">'+injHtml+(item.extractedText?'<div><span class="lbl-sm">추출 텍스트</span><div class="ocr"><code>'+h(item.extractedText)+'</code></div></div>':'')+(fHtml?'<div><span class="lbl-sm">탐지 결과</span><div class="finding-list">'+fHtml+'</div></div>':'')+'<div style="font-size:11px;color:var(--muted);">해시: <code>'+h((item.imageHash||'').slice(0,16))+'</code> · 신뢰도: '+h(item.confidence??'n/a')+'</div></div></div></div>';
     }).join('');
   } else {
     html+='<div class="panel"><div class="panel-bd" style="padding:16px;"><div class="empty">이미지 분석 결과가 없습니다. <code>scan-image --file &lt;경로&gt;</code> 명령으로 이미지를 분석하세요.</div></div></div>';
@@ -824,18 +1315,132 @@ function renderRules(model){
   document.getElementById('rule-content').innerHTML=html;
 }
 
+// ── 토스트 알림 ─────────────────────────────────────────────────────────────
+function showToast(event){
+  const container=document.getElementById('toast-container');
+  const d=event.decision;
+  const ruleId=event.findings?.[0]?.id??'';
+  const rationale=event.findings?.[0]?.rationale??'';
+  const severity=event.findings?.[0]?.severity??'';
+  const aid=event.event?.agentId??'';
+  const aLbl=AGENT_LABEL[aid]??aid;
+  const toast=document.createElement('div');
+  toast.className='toast '+d;
+  toast.innerHTML='<span class="toast-icon">'+(d==='block'?'🚫':'⚠️')+'</span>'+
+    '<div class="toast-body">'+
+      '<div class="toast-title '+d+'">'+(d==='block'?'차단됨':'경고')+': '+h(ruleId)+'</div>'+
+      '<div class="toast-detail">'+h(rationale.slice(0,80))+(aLbl?' · '+h(aLbl):'')+'</div>'+
+      (severity?'<span class="toast-severity '+h(severity)+'">'+h(severity)+'</span>':'')+
+    '</div>';
+  container.appendChild(toast);
+  setTimeout(()=>toast.remove(),5000);
+}
+
+function checkNewBlocks(model){
+  for(const e of(model.events||[])){
+    if(seenEventIds.has(e.id))continue;
+    seenEventIds.add(e.id);
+    if(e.decision==='block'||(e.decision==='warn'&&(e.findings??[]).some(f=>f.severity==='critical'||f.severity==='high'))){
+      showToast(e);
+    }
+  }
+}
+
+// ── 액션 배너 ───────────────────────────────────────────────────────────────
+function renderActionBanner(model){
+  const el=document.getElementById('action-banner');
+  const ss=model.safetyScore||{score:100,level:'safe'};
+  const recentBlocks=(model.events||[]).filter(e=>e.decision==='block'&&Date.now()-Date.parse(e.timestamp??'')<300000);
+  if(recentBlocks.length>0){
+    const agents=[...new Set(recentBlocks.map(e=>e.event?.agentId).filter(Boolean))];
+    el.style.display='flex';
+    el.className='action-banner critical';
+    el.innerHTML='<span class="action-banner-icon">🚨</span>'+
+      '<div class="action-banner-text"><strong>'+recentBlocks.length+'건의 차단 이벤트</strong>가 최근 5분 내 발생했습니다.'+
+      (agents.length?' 감지 에이전트: '+agents.map(a=>h(AGENT_LABEL[a]||a)).join(', '):'')+
+      '</div><div class="action-banner-actions"><button class="action-banner-btn primary" data-tab="history">히스토리 보기</button></div>';
+  } else if(ss.level==='caution'){
+    el.style.display='flex';el.className='action-banner warning';
+    el.innerHTML='<span class="action-banner-icon">⚠️</span><div class="action-banner-text">보안 점수 <strong>'+ss.score+'점</strong> — 경고 이벤트를 확인하세요.</div>';
+  } else if(ss.score<100){
+    el.style.display='flex';el.className='action-banner safe';
+    el.innerHTML='<span class="action-banner-icon">✅</span><div class="action-banner-text">현재 안전 상태입니다. 보안 점수 '+ss.score+'점.</div>';
+  } else {
+    el.style.display='none';
+  }
+}
+
+// ── 에이전트 상세 확장 패널 ─────────────────────────────────────────────────
+function toggleAgentDetail(agentId){
+  const existing=document.querySelector('.agent-detail-panel[data-for="'+agentId+'"]');
+  if(existing){existing.remove();return;}
+  document.querySelectorAll('.agent-detail-panel').forEach(p=>p.remove());
+  if(!lastModel)return;
+  const stats=(lastModel.agentStats||[]).find(s=>s.agentId===agentId);
+  const events=(lastModel.events||[]).filter(e=>(e.event?.agentId??'')===agentId);
+  if(!stats)return;
+  const role=agentId.replace('agent-','');
+  const m=ROLE_META[role]||{icon:'🤖',label:agentId,sub:''};
+  const rate=stats.total?((stats.blockRate)*100).toFixed(0):'0';
+
+  const ruleBarsHtml=stats.topRules.length
+    ?stats.topRules.map(([r,n])=>{
+      const maxN=stats.topRules[0][1];
+      const pct=maxN?(n/maxN*100):0;
+      return '<div class="rule-bar"><div class="rule-bar-fill" style="width:'+pct+'%;"></div><code>'+h(r)+'</code><span>'+n+'건</span></div>';
+    }).join('')
+    :'<div style="font-size:11px;color:var(--muted);">차단된 룰이 없습니다.</div>';
+
+  const surfTotal=Object.values(stats.surfaces).reduce((a,b)=>a+b,0)||1;
+  const surfBarHtml='<div class="surf-bar-wrap">'+
+    Object.entries(stats.surfaces).map(([s,n])=>{
+      const pct=((n/surfTotal)*100).toFixed(1);
+      const c=SURF_COLORS[s]||'#94a3b8';
+      return '<div class="surf-bar-seg" style="width:'+pct+'%;background:'+c+';" title="'+h(s)+': '+n+'건">'+h(s.slice(0,3))+'</div>';
+    }).join('')+'</div>';
+
+  const recentHtml=events.slice(0,8).map(e=>{
+    const d=e.decision||'allow';
+    return '<div class="tl-row '+d+'" style="margin-bottom:2px;"><div class="tl-head"><span class="tl-ts">'+fmt(e.timestamp)+'</span><span class="tl-dec '+d+'">'+ST_LABEL[d]+'</span>'+bdg(surf(e))+'<span class="tl-txt"><code>'+h((e.event?.text??e.text??'').slice(0,60))+'</code></span></div></div>';
+  }).join('');
+
+  const panel=document.createElement('div');
+  panel.className='agent-detail-panel';
+  panel.dataset.for=agentId;
+  panel.innerHTML='<div class="adp-header"><h3>'+m.icon+' '+h(m.label)+' — 상세 분석</h3><button class="adp-close">✕</button></div>'+
+    '<div class="adp-stats-row">'+
+      '<div class="adp-stat"><div class="adp-stat-val" style="color:var(--block);">'+stats.block+'</div><div class="adp-stat-lbl">차단</div></div>'+
+      '<div class="adp-stat"><div class="adp-stat-val" style="color:var(--warn);">'+stats.warn+'</div><div class="adp-stat-lbl">경고</div></div>'+
+      '<div class="adp-stat"><div class="adp-stat-val" style="color:var(--allow);">'+stats.allow+'</div><div class="adp-stat-lbl">허용</div></div>'+
+      '<div class="adp-stat"><div class="adp-stat-val">'+rate+'%</div><div class="adp-stat-lbl">차단율</div></div>'+
+      '<div class="adp-stat"><div class="adp-stat-val">'+stats.total+'</div><div class="adp-stat-lbl">총 이벤트</div></div>'+
+    '</div>'+
+    '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">'+
+      '<div class="adp-section"><h4>상위 트리거 룰</h4>'+ruleBarsHtml+'</div>'+
+      '<div class="adp-section"><h4>서피스 분포</h4>'+surfBarHtml+'</div>'+
+    '</div>'+
+    '<div class="adp-section"><h4>최근 이벤트</h4><div class="adp-events">'+recentHtml+'</div></div>';
+
+  const grid=document.getElementById('agent-flows');
+  const col=grid.querySelector('[data-agent-id="'+agentId+'"]');
+  if(col&&col.nextSibling)grid.insertBefore(panel,col.nextSibling);
+  else grid.appendChild(panel);
+}
+
 // ── 전체 렌더 ─────────────────────────────────────────────────────────────────
 function renderAll(model){
   lastModel=model;
-  renderMetrics(model.counts);
+  checkNewBlocks(model);
+  renderMetrics(model.counts,model.safetyScore);
   if(activeTab==='overview'){
-    renderGraph(model);
-    renderAgentCards(model.agents);
+    renderActionBanner(model);
+    renderAgentFlows(model);
+    renderVisionFlow(model);
     renderDiscoveries(model.hiddenPromptDiscoveries||[]);
     renderAlerts(model.alerts);
     renderFeed(model.events);
   } else if(activeTab==='history'){
-    renderHistory(model.events);
+    renderHistory(model);
   } else if(activeTab==='forensics'){
     renderForensics(model);
   } else if(activeTab==='rules'){

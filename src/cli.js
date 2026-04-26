@@ -96,6 +96,25 @@ function parseArgs(argv) {
   return { command: positionals[0] ?? 'help', text: positionals.slice(1).join(' '), options, passthrough, positionals };
 }
 
+import { execSync } from 'node:child_process';
+
+function notifyBlock(result) {
+  const ruleId = result.findings[0]?.id ?? 'unknown-rule';
+  const sev = result.severity ?? 'high';
+  const surface = result.surface ?? '?';
+  const msg = `🚫 [404gent BLOCK] ${surface.toUpperCase()} | ${ruleId} (${sev})`;
+  // tmux: display-message in status bar (works inside cmux/tmux session)
+  if (process.env.TMUX) {
+    try { execSync(`tmux display-message -p "${msg.replace(/"/g, "'")}"`); } catch {}
+  }
+  // macOS system notification (fallback)
+  if (process.platform === 'darwin') {
+    try {
+      execSync(`osascript -e 'display notification "${msg.replace(/"/g, "'")}" with title "404gent 보안 차단"'`);
+    } catch {}
+  }
+}
+
 function printResult(result, json) {
   if (json) {
     console.log(JSON.stringify(result, null, 2));
@@ -123,6 +142,10 @@ function printResult(result, json) {
   }
   for (const finding of result.findings) {
     console.log(`- [${finding.severity}] ${finding.id}: ${finding.rationale}`);
+  }
+
+  if (result.decision === 'block') {
+    notifyBlock(result);
   }
 }
 
