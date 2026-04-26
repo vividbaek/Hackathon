@@ -8,46 +8,14 @@ import { tmpdir } from 'node:os';
 import { detectAndDecodeQR } from './utils/qr-processor.js';
 
 import pkgCanvas from 'canvas';
-const { createCanvas, DOMMatrix, Image, Canvas } = pkgCanvas;
+const { createCanvas, DOMMatrix } = pkgCanvas;
 
 // Polyfills for Node.js
 if (typeof global.DOMMatrix === 'undefined') {
   global.DOMMatrix = DOMMatrix;
 }
-if (typeof global.Image === 'undefined') {
-  global.Image = Image;
-}
-if (typeof global.HTMLImageElement === 'undefined') {
-  global.HTMLImageElement = Image;
-}
-if (typeof global.Canvas === 'undefined') {
-  global.Canvas = Canvas;
-}
-
-// Minimal DOM Mock for SVGGraphics in Node.js
-if (typeof global.document === 'undefined') {
-  global.document = {
-    createElementNS: (ns, name) => ({
-      namespaceURI: ns,
-      nodeName: name,
-      attributes: {},
-      style: {},
-      setAttribute: function(n, v) { this.attributes[n] = v; },
-      getAttribute: function(n) { return this.attributes[n]; },
-      appendChild: function() {},
-      toString: function() { return `<${this.nodeName} ${Object.entries(this.attributes).map(([k,v]) => `${k}="${v}"`).join(' ')} />`; }
-    })
-  };
-}
-
-if (typeof global.XMLSerializer === 'undefined') {
-  global.XMLSerializer = class {
-    serializeToString(node) { return node.toString(); }
-  };
-}
 
 import * as pdfjs from 'pdfjs-dist/legacy/build/pdf.mjs';
-const { SVGGraphics } = pdfjs;
 
 // Node.js worker setup
 pdfjs.GlobalWorkerOptions.workerSrc = path.resolve('./node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs');
@@ -419,26 +387,21 @@ if (process.argv[1].endsWith('ocr.js')) {
       console.error(`📄 PDF detected: ${filePath}. Extracting first page...`);
       try {
         const data = new Uint8Array(await readFile(filePath));
-        const loadingTask = pdfjs.getDocument({ 
-          data, 
-          verbosity: 0,
-          disableFontFace: true
-        });
-        
+        const loadingTask = pdfjs.getDocument({ data, verbosity: 0 });
         const pdf = await loadingTask.promise;
         const page = await pdf.getPage(1);
         const viewport = page.getViewport({ scale: 2.0 });
         
-        // Use SVG Graphics to avoid node-canvas issues
-        const operatorList = await page.getOperatorList();
-        const svgGfx = new SVGGraphics(page.commonObjs, page.objs);
-        const svgElement = await svgGfx.getSVG(operatorList, viewport);
+        const canvas = createCanvas(viewport.width, viewport.height);
+        const context = canvas.getContext('2d');
         
-        // Convert SVG to PNG buffer using sharp
-        const svgString = svgElement.toString();
-        inputSource = await sharp(Buffer.from(svgString))
-          .png()
-          .toBuffer();
+        await page.render({
+          canvasContext: context,
+          viewport: viewport,
+          intent: 'print'
+        }).promise;
+        
+        inputSource = canvas.toBuffer('image/png');
       } catch (err) {
         console.error('Failed to process PDF:', err);
         process.exit(1);
