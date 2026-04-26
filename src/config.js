@@ -6,6 +6,14 @@ export const DEFAULT_CONFIG = {
   dataDir: '.404gent',
   failClosed: false,
   blockSeverities: ['critical', 'high'],
+  llm: {
+    enabled: false,
+    provider: 'anthropic',
+    model: 'claude-sonnet-4-5',
+    apiKeyEnv: 'ANTHROPIC_API_KEY',
+    reviewTypes: ['image', 'vision_observation', 'llm', 'prompt'],
+    reviewDecisions: ['allow', 'warn']
+  },
   rules: defaultRules
 };
 
