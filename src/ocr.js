@@ -9,7 +9,6 @@ import { detectAndDecodeQR } from './utils/qr-processor.js';
 import { loadConfig } from './config.js';
 import { scanText } from './policy/engine.js';
 import { recordReport } from './guard.js';
-import { preprocessImage } from './image-preprocess.js';
 
 import pkgCanvas from 'canvas';
 const { createCanvas, DOMMatrix } = pkgCanvas;
@@ -477,36 +476,32 @@ async function runPipelineForSource(source, originalPath, pageNum) {
     // Record to .404gent/ for dashboard integration
     try {
       const config = await loadConfig();
-      const preprocessResult = await preprocessImage(originalPath, config, { quiet: true });
-      const detections = preprocessResult.preprocessed?.detections ?? [];
-      const hiddenTexts = detections.filter(d => d.kind === 'hidden_text').map(d => d.text);
-      const allTexts = detections.map(d => d.text);
-      const scanInput = [...hiddenTexts, ...allTexts].filter(Boolean).join('\n');
       const hiddenPrompts = data.hiddenAttacks.map(a => a.text);
+      const visibleTexts = data.normalWords?.map(w => w.text) ?? [];
+      const scanInput = [...hiddenPrompts, ...visibleTexts].filter(Boolean).join('\n');
       const regions = data.hiddenAttacks.map(a => ({ x: a.x, y: a.y, w: a.w, h: a.h, text: a.text, score: a.score }));
+      const sourceLabel = pageNum ? `${originalPath} (page ${pageNum})` : originalPath;
       const result = scanText({
         surface: 'image',
-        text: scanInput || hiddenPrompts.join('\n'),
+        text: scanInput,
         config,
         evidence: {
-          imageId: preprocessResult.imageId,
-          imagePath: originalPath,
-          extractedText: data.visibleText || allTexts.join(' '),
+          imagePath: sourceLabel,
+          extractedText: data.visibleText || visibleTexts.join(' '),
           hiddenPrompts: hiddenPrompts.length ? hiddenPrompts : [],
           regions,
           confidence: data.hiddenAttacks.length > 0 ? Math.max(...data.hiddenAttacks.map(a => (a.score ?? 0) / 100)) : null
         }
       });
-      const criticalHidden = detections.filter(d => d.kind === 'hidden_text' && d.severityHint === 'critical');
-      if (criticalHidden.length > 0 && result.decision === 'allow') {
+      if (data.hiddenAttacks.length > 0 && result.decision === 'allow') {
         result.decision = 'block';
         if (!result.findings) result.findings = [];
-        for (const det of criticalHidden) {
-          result.findings.push({ id: 'image-hidden-attack', severity: 'critical', rationale: `Hidden ${det.meta?.type ?? 'text'} detected: ${(det.text ?? '').slice(0, 80)}`, category: det.meta?.category ?? 'visual_prompt_injection' });
+        for (const atk of data.hiddenAttacks) {
+          result.findings.push({ id: 'image-hidden-attack', severity: 'critical', rationale: `Hidden ${atk.type ?? 'text'} detected: ${(atk.text ?? '').slice(0, 80)}`, category: atk.category ?? 'visual_prompt_injection' });
         }
       }
       await recordReport(result, config);
-      console.error(`Dashboard event recorded for ${originalPath}`);
+      console.error(`Dashboard event recorded for ${sourceLabel}`);
     } catch (e) {
       console.error(`Warning: failed to record dashboard event: ${e.message}`);
     }
