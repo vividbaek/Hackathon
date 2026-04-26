@@ -7,12 +7,60 @@ const DEFAULT_PORT = 4040;
 const MAX_PORT = 4050;
 
 const agentDefinitions = [
-  { id:'vision-agent',    label:'Vision Agent',    role:'이미지 / VLM 추출',    icon:'👁',  x:40,  y:110, types:['image','vision_observation'] },
-  { id:'policy-agent',    label:'Policy Agent',    role:'룰베이스 탐지',        icon:'🛡',  x:270, y:110, types:['prompt','command','output','image','vision_observation','llm'] },
-  { id:'llm-review-agent',label:'LLM Review',      role:'Claude 에스컬레이션',  icon:'🤖',  x:500, y:30,  types:['llm'] },
-  { id:'forensic-agent',  label:'Forensic Agent',  role:'증거 로깅',            icon:'🔍',  x:500, y:190, types:['prompt','command','output','image','vision_observation','llm'] },
-  { id:'rule-agent',      label:'Rule Agent',      role:'자동 룰 후보 생성',    icon:'⚙',  x:730, y:190, types:[] },
-  { id:'supervisor-agent',label:'Supervisor',      role:'차단 / 경고 / 허용',   icon:'🎯',  x:730, y:30,  types:['prompt','command','output','image','vision_observation','llm'] }
+  {
+    id: 'vision-agent',
+    label: 'Vision Agent',
+    role: 'Image/VLM extraction',
+    icon: '👁',
+    x: 90,
+    y: 155,
+    types: ['image', 'vision_observation']
+  },
+  {
+    id: 'policy-agent',
+    label: 'Policy Agent',
+    role: 'Rule-based detection',
+    icon: '🛡',
+    x: 300,
+    y: 155,
+    types: ['prompt', 'command', 'output', 'image', 'vision_observation', 'llm', 'os']
+  },
+  {
+    id: 'llm-review-agent',
+    label: 'LLM Review',
+    role: 'Claude escalation',
+    icon: '🤖',
+    x: 510,
+    y: 85,
+    types: ['llm']
+  },
+  {
+    id: 'forensic-agent',
+    label: 'Forensic Agent',
+    role: 'Evidence logging',
+    icon: '🔍',
+    x: 510,
+    y: 235,
+    types: ['prompt', 'command', 'output', 'image', 'vision_observation', 'llm', 'os']
+  },
+  {
+    id: 'rule-agent',
+    label: 'Rule Agent',
+    role: 'Self-loop candidates',
+    icon: '⚙',
+    x: 720,
+    y: 235,
+    types: []
+  },
+  {
+    id: 'supervisor-agent',
+    label: 'Supervisor',
+    role: 'Block/warn/allow',
+    icon: '🎯',
+    x: 720,
+    y: 85,
+    types: ['prompt', 'command', 'output', 'image', 'vision_observation', 'llm', 'os']
+  }
 ];
 
 const graphEdges = [

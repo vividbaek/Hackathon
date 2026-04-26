@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 import { applyCompanyProfile, loadConfig } from './config.js';
 import { mergeReports, scanText } from './policy/engine.js';
-import { appendAuditEvent } from './audit.js';
-import { updateState } from './state.js';
-import { appendVectorDocument } from './vector-store.js';
-import { createLlmProvider, shouldReviewWithLlm } from './providers/llm.js';
 import { encodeImageFile, createVisionProviderFromConfig } from './providers/vision-llm.js';
 import { highestSeverity } from './policy/severity.js';
 import { runGuardedCommand } from './runner.js';
 import { createAgentHandoff, saveAgentHandoff } from './harness.js';
+import { guardAndRecord, recordReport } from './guard.js';
+import { startPolicyServer } from './server.js';
+import { createExecEvent, createOpenEvent } from './integrations/os-guard.js';
+import { fetchDaemonStatus, findProcessIdsByNames, registerPidWithDaemon } from './integrations/es-daemon.js';
 
 const HELP = `404gent - Terminal-first guardrails for AI coding agents in cmux.
 
@@ -22,6 +22,12 @@ Usage:
   404gent scan-llm <text>
   404gent agent --role <qa|backend|security> -- <task>
   404gent run -- <command> [args...]
+  404gent server
+  404gent os-guard status
+  404gent os-guard simulate-open <path> [--agent name] [--pid pid]
+  404gent os-guard simulate-exec <command...> [--agent name] [--pid pid]
+  404gent os-guard register-existing [--names codex,claude,gemini,opencode]
+  404gent agent --name demo --with-os-guard -- <command>
   404gent doctor
   404gent tower
 
@@ -31,11 +37,26 @@ Options:
   --role <role>     Agent harness role. Defaults to qa.
   --company <id>    Company profile id for agent handoff metadata.
   --json            Print machine-readable JSON.
+  --agent <name>    Agent name for OS Guard events.
+  --pid <pid>       Process id for OS Guard events.
+  --names <names>   Comma-separated process names for register-existing.
+  --with-os-guard   Register spawned agent process with OS Guard.
 `;
 
 function parseArgs(argv) {
   const args = [...argv];
-  const options = { json: false, configPath: undefined, filePath: undefined, role: 'qa', companyId: undefined };
+  const options = {
+    json: false,
+    configPath: undefined,
+    filePath: undefined,
+    role: 'qa',
+    companyId: undefined,
+    agent: undefined,
+    pid: undefined,
+    names: undefined,
+    withOsGuard: false,
+    name: undefined
+  };
   const positionals = [];
   const separatorIndex = args.indexOf('--');
   let passthrough = [];
@@ -57,12 +78,22 @@ function parseArgs(argv) {
       options.role = args.shift() ?? 'qa';
     } else if (arg === '--company') {
       options.companyId = args.shift();
+    } else if (arg === '--agent' || arg === '--name') {
+      const value = args.shift();
+      options.agent = value;
+      options.name = value;
+    } else if (arg === '--pid') {
+      options.pid = Number(args.shift());
+    } else if (arg === '--names') {
+      options.names = args.shift();
+    } else if (arg === '--with-os-guard') {
+      options.withOsGuard = true;
     } else {
       positionals.push(arg);
     }
   }
 
-  return { command: positionals[0] ?? 'help', text: positionals.slice(1).join(' '), options, passthrough };
+  return { command: positionals[0] ?? 'help', text: positionals.slice(1).join(' '), options, passthrough, positionals };
 }
 
 function printResult(result, json) {
@@ -96,7 +127,7 @@ function printResult(result, json) {
 }
 
 export async function main(argv = process.argv.slice(2)) {
-  const { command, text, options, passthrough } = parseArgs(argv);
+  const { command, text, options, passthrough, positionals } = parseArgs(argv);
 
   if (command === 'help' || command === '--help' || command === '-h') {
     console.log(HELP);
@@ -119,26 +150,23 @@ export async function main(argv = process.argv.slice(2)) {
     return 0;
   }
 
-  async function recordReport(report) {
-    await appendAuditEvent(report, config);
-    await appendVectorDocument(report, config);
-    await updateState(report, config);
-  }
-
   if (command === 'run') {
     const result = await runGuardedCommand(passthrough.length > 0 ? passthrough : text.split(' ').filter(Boolean), {
       config,
-      recordReport
+      recordReport: (report) => recordReport(report, config)
     });
     return result.exitCode;
   }
 
   if (command === 'agent') {
+    if (options.withOsGuard) {
+      return handleAgentCommand({ argv: passthrough, options });
+    }
     const task = passthrough.length > 0 ? passthrough.join(' ') : text;
     const handoff = createAgentHandoff({ role: options.role, task, config, companyId: config.companyId });
     const paths = await saveAgentHandoff(handoff, config);
-    await recordReport(handoff.promptReport);
-    await recordReport(handoff.handoffReport);
+    await recordReport(handoff.promptReport, config);
+    await recordReport(handoff.handoffReport, config);
     if (options.json) {
       console.log(JSON.stringify({ ...handoff, paths }, null, 2));
     } else {
@@ -146,6 +174,17 @@ export async function main(argv = process.argv.slice(2)) {
       console.log(`\nSaved handoff: ${paths.rolePath}`);
     }
     return handoff.promptReport.decision === 'block' ? 1 : 0;
+  }
+
+  if (command === 'server') {
+    const { host, port } = await startPolicyServer({ configPath: options.configPath });
+    console.log(`404gent policy server listening on http://${host}:${port}`);
+    await new Promise(() => {});
+    return 0;
+  }
+
+  if (command === 'os-guard') {
+    return handleOsGuardCommand({ argv: positionals.slice(1), options, config });
   }
 
   const surfaces = {
@@ -198,27 +237,104 @@ export async function main(argv = process.argv.slice(2)) {
       };
     }
 
-    await recordReport(result);
+    await recordReport(result, config);
     printResult(result, options.json);
     return result.decision === 'block' ? 1 : 0;
   }
 
   // Generic text scan for all other surfaces (and scan-image without --file)
-  let result = scanText({ surface, text, config });
-  if (shouldReviewWithLlm(result, config)) {
-    const llmReport = await createLlmProvider(config).evaluate(result);
-    const merged = mergeReports(result, llmReport, config);
-    result = {
-      ...merged,
-      surface,
-      text: String(text ?? ''),
-      severity: merged.findings.length > 0 ? highestSeverity(merged.findings) : 'low',
-      scannedAt: result.scannedAt
-    };
-  }
-  await recordReport(result);
+  const result = await guardAndRecord({ type: surface, text }, config);
   printResult(result, options.json);
   return result.decision === 'block' ? 1 : 0;
+}
+
+async function handleOsGuardCommand({ argv, options, config }) {
+  const subcommand = argv[0] ?? 'status';
+
+  if (subcommand === 'status') {
+    try {
+      const status = await fetchDaemonStatus();
+      console.log(options.json ? JSON.stringify(status, null, 2) : `OS Guard daemon: watching ${status.watchedPIDs?.length ?? 0} PID(s), watchAll=${Boolean(status.watchAll)}`);
+      return 0;
+    } catch (error) {
+      const result = { ok: false, error: error.message };
+      console.log(options.json ? JSON.stringify(result, null, 2) : `OS Guard daemon unavailable: ${error.message}`);
+      return 1;
+    }
+  }
+
+  if (subcommand === 'simulate-open') {
+    const path = argv[1];
+    if (!path) {
+      console.error('simulate-open requires a path.');
+      return 2;
+    }
+    const result = await guardAndRecord(createOpenEvent(path, {
+      agent: options.agent,
+      pid: options.pid,
+      mode: 'simulate'
+    }), config);
+    printResult(result, options.json);
+    return result.decision === 'block' ? 1 : 0;
+  }
+
+  if (subcommand === 'simulate-exec') {
+    const command = argv.slice(1);
+    if (command.length === 0) {
+      console.error('simulate-exec requires a command.');
+      return 2;
+    }
+    const result = await guardAndRecord(createExecEvent(command, {
+      agent: options.agent,
+      pid: options.pid,
+      mode: 'simulate'
+    }), config);
+    printResult(result, options.json);
+    return result.decision === 'block' ? 1 : 0;
+  }
+
+  if (subcommand === 'register-existing') {
+    const names = (options.names ?? 'codex,claude,gemini,opencode').split(',');
+    const matches = await findProcessIdsByNames(names);
+    const registered = [];
+    for (const match of matches) {
+      registered.push(await registerPidWithDaemon({ pid: match.pid, agent: match.name }));
+    }
+    const result = { registered: registered.length, matches };
+    console.log(JSON.stringify(result, null, 2));
+    return 0;
+  }
+
+  console.error(`Unknown os-guard command: ${subcommand}`);
+  return 2;
+}
+
+async function handleAgentCommand({ argv, options }) {
+  const command = argv;
+  if (command.length === 0) {
+    console.error('agent requires a command after --.');
+    return 2;
+  }
+
+  const { spawn } = await import('node:child_process');
+  const child = spawn(command[0], command.slice(1), { stdio: 'inherit' });
+  if (options.withOsGuard) {
+    try {
+      await registerPidWithDaemon({ pid: child.pid, agent: options.agent ?? 'agent' });
+    } catch (error) {
+      console.error(`OS Guard PID registration failed: ${error.message}`);
+    }
+  }
+
+  return new Promise((resolve) => {
+    child.on('exit', (code, signal) => {
+      if (signal) {
+        resolve(1);
+        return;
+      }
+      resolve(code ?? 0);
+    });
+  });
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
