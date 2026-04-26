@@ -1,4 +1,6 @@
 import { scanText } from './policy/engine.js';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 
 export const agentRoles = {
   qa: {
@@ -23,6 +25,11 @@ export const agentRoles = {
 
 function roleConfig(role) {
   return agentRoles[role] ?? agentRoles.qa;
+}
+
+export function createSessionId(role = 'agent') {
+  const random = Math.random().toString(36).slice(2, 8);
+  return `sess_${role}_${Date.now().toString(36)}_${random}`;
 }
 
 function summarizeFindings(report) {
@@ -52,11 +59,13 @@ function buildSafeContext(promptReport) {
   ];
 }
 
-export function buildAgentBrief({ role = 'qa', task = '', promptReport }) {
+export function buildAgentBrief({ role = 'qa', task = '', promptReport, sessionId, companyId }) {
   const selectedRole = roleConfig(role);
   const safeContext = buildSafeContext(promptReport);
 
-  return `Role: ${selectedRole.label}
+  return `Session: ${sessionId}
+Company: ${companyId ?? 'default'}
+Role: ${selectedRole.label}
 
 User Task:
 ${task}
@@ -84,30 +93,39 @@ ${summarizeFindings(promptReport)}
 `;
 }
 
-export function createAgentHandoff({ role = 'qa', task = '', config = {} }) {
+export function createAgentHandoff({ role = 'qa', task = '', config = {}, sessionId = createSessionId(role), companyId = config.companyId }) {
   const promptReport = scanText({
     surface: 'prompt',
     text: task,
     config,
     source: 'agent-harness',
+    companyId,
+    agentId: `agent-${role}`,
     meta: {
-      role
+      role,
+      sessionId,
+      companyId
     }
   });
 
-  const brief = buildAgentBrief({ role, task, promptReport });
+  const brief = buildAgentBrief({ role, task, promptReport, sessionId, companyId });
   const handoffReport = scanText({
     surface: 'llm',
     text: brief,
     config,
     source: 'agent-harness',
+    companyId,
     agentId: `agent-${role}`,
     meta: {
       role,
+      sessionId,
+      companyId,
       intakeEventId: promptReport.id
     },
     evidence: {
       role,
+      sessionId,
+      companyId,
       originalTask: task,
       safeBrief: brief,
       intakeDecision: promptReport.decision
@@ -115,10 +133,31 @@ export function createAgentHandoff({ role = 'qa', task = '', config = {} }) {
   });
 
   return {
+    sessionId,
+    companyId,
     role,
     task,
     promptReport,
     handoffReport,
     brief
+  };
+}
+
+export async function saveAgentHandoff(handoff, config = {}) {
+  const dataDir = config.dataDir ?? '.404gent';
+  const handoffDir = join(dataDir, 'handoffs');
+  await mkdir(handoffDir, { recursive: true });
+
+  const rolePath = join(handoffDir, `${handoff.role}-latest.md`);
+  const sessionPath = join(handoffDir, `${handoff.sessionId}.md`);
+  const body = `${handoff.brief}\n`;
+  await Promise.all([
+    writeFile(rolePath, body),
+    writeFile(sessionPath, body)
+  ]);
+
+  return {
+    rolePath,
+    sessionPath
   };
 }

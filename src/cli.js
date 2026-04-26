@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { loadConfig } from './config.js';
+import { applyCompanyProfile, loadConfig } from './config.js';
 import { mergeReports, scanText } from './policy/engine.js';
 import { appendAuditEvent } from './audit.js';
 import { updateState } from './state.js';
@@ -8,7 +8,7 @@ import { createLlmProvider, shouldReviewWithLlm } from './providers/llm.js';
 import { encodeImageFile, createVisionProviderFromConfig } from './providers/vision-llm.js';
 import { highestSeverity } from './policy/severity.js';
 import { runGuardedCommand } from './runner.js';
-import { createAgentHandoff } from './harness.js';
+import { createAgentHandoff, saveAgentHandoff } from './harness.js';
 
 const HELP = `404gent - Terminal-first guardrails for AI coding agents in cmux.
 
@@ -29,12 +29,13 @@ Options:
   --config <path>   Load a JSON config file.
   --file <path>     Image file path for scan-image (enables Claude Vision analysis).
   --role <role>     Agent harness role. Defaults to qa.
+  --company <id>    Company profile id for agent handoff metadata.
   --json            Print machine-readable JSON.
 `;
 
 function parseArgs(argv) {
   const args = [...argv];
-  const options = { json: false, configPath: undefined, filePath: undefined, role: 'qa' };
+  const options = { json: false, configPath: undefined, filePath: undefined, role: 'qa', companyId: undefined };
   const positionals = [];
   const separatorIndex = args.indexOf('--');
   let passthrough = [];
@@ -54,6 +55,8 @@ function parseArgs(argv) {
       options.filePath = args.shift();
     } else if (arg === '--role') {
       options.role = args.shift() ?? 'qa';
+    } else if (arg === '--company') {
+      options.companyId = args.shift();
     } else {
       positionals.push(arg);
     }
@@ -100,7 +103,10 @@ export async function main(argv = process.argv.slice(2)) {
     return 0;
   }
 
-  const config = await loadConfig({ configPath: options.configPath });
+  let config = await loadConfig({ configPath: options.configPath });
+  if (options.companyId) {
+    config = applyCompanyProfile(config, options.companyId);
+  }
 
   if (command === 'doctor') {
     const result = { ok: true, node: process.versions.node, config };
@@ -129,13 +135,15 @@ export async function main(argv = process.argv.slice(2)) {
 
   if (command === 'agent') {
     const task = passthrough.length > 0 ? passthrough.join(' ') : text;
-    const handoff = createAgentHandoff({ role: options.role, task, config });
+    const handoff = createAgentHandoff({ role: options.role, task, config, companyId: config.companyId });
+    const paths = await saveAgentHandoff(handoff, config);
     await recordReport(handoff.promptReport);
     await recordReport(handoff.handoffReport);
     if (options.json) {
-      console.log(JSON.stringify(handoff, null, 2));
+      console.log(JSON.stringify({ ...handoff, paths }, null, 2));
     } else {
       console.log(handoff.brief);
+      console.log(`\nSaved handoff: ${paths.rolePath}`);
     }
     return handoff.promptReport.decision === 'block' ? 1 : 0;
   }

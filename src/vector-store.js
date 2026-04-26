@@ -21,7 +21,13 @@ export function createVectorDocument(report) {
 }
 
 export async function appendVectorDocument(report, config = {}) {
+  const provider = config.vectorStore?.provider ?? 'jsonl';
+  if (provider !== 'jsonl') {
+    return { skipped: true, provider, reason: 'provider_not_configured' };
+  }
+
   const path = getVectorEventsPath(config);
   await mkdir(dirname(path), { recursive: true });
   await appendFile(path, `${JSON.stringify(createVectorDocument(report))}\n`);
+  return { skipped: false, provider, path };
 }

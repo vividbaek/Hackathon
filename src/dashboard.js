@@ -149,6 +149,35 @@ function summarizeSurfaces(events) {
   return c;
 }
 
+function collectTimeline(events, candidates) {
+  const eventItems = events.map((event) => ({
+    kind: 'event',
+    timestamp: eventTime(event),
+    title: `${event.decision?.toUpperCase() ?? 'EVENT'} ${eventType(event)}`,
+    detail: event.event?.text ?? event.text ?? '',
+    decision: event.decision,
+    sessionId: event.event?.meta?.sessionId,
+    agentId: event.event?.agentId,
+    findingCount: event.findings?.length ?? 0
+  }));
+
+  const candidateItems = candidates.map((candidate) => ({
+    kind: 'candidate',
+    timestamp: candidate.generatedAt,
+    title: `RULE CANDIDATE ${candidate.priority ?? ''}`.trim(),
+    detail: candidate.rule?.id ?? candidate.id,
+    decision: 'warn',
+    sessionId: null,
+    agentId: 'rule-agent',
+    findingCount: candidate.evidence?.length ?? 0
+  }));
+
+  return [...eventItems, ...candidateItems]
+    .filter((item) => item.timestamp)
+    .sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp))
+    .slice(0, 50);
+}
+
 export function buildDashboardModel({ events = [], candidates = [], state = {} } = {}) {
   const recentEvents = events.slice(-100);
   const candidateList = Array.isArray(candidates) ? candidates : candidates.candidates ?? [];
@@ -164,6 +193,7 @@ export function buildDashboardModel({ events = [], candidates = [], state = {} }
     imageFindings: collectImageFindings(recentEvents),
     hiddenPromptDiscoveries: collectHiddenPromptDiscoveries(recentEvents),
     candidates: candidateList.slice(0, 8),
+    timeline: collectTimeline(recentEvents, candidateList),
     events: recentEvents.slice(-100).reverse(),
     surfaceCounts: summarizeSurfaces(recentEvents)
   };
@@ -188,7 +218,7 @@ function sendHtml(res) {
 }
 function mimeType(p) {
   const x = extname(p).toLowerCase();
-  return { '.png':'image/png', '.jpg':'image/jpeg', '.jpeg':'image/jpeg', '.gif':'image/gif', '.webp':'image/webp' }[x] ?? 'application/octet-stream';
+  return { '.png':'image/png', '.jpg':'image/jpeg', '.jpeg':'image/jpeg', '.gif':'image/gif', '.webp':'image/webp', '.svg':'image/svg+xml' }[x] ?? 'application/octet-stream';
 }
 function resolveEvidencePath(p) {
   const root = resolve(process.cwd());

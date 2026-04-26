@@ -143,6 +143,16 @@ test('overrides severity tuning', () => {
   assert.equal(result.findings[0].severity, 'high');
 });
 
+test('policy mode observe warns instead of blocking', () => {
+  const result = analyzeEvent({ type: 'command', text: 'rm -rf /' }, { mode: 'observe' });
+  assert.equal(result.decision, 'warn');
+});
+
+test('policy mode lockdown blocks medium findings', () => {
+  const result = analyzeEvent({ type: 'command', text: 'nmap localhost' }, { mode: 'lockdown' });
+  assert.equal(result.decision, 'block');
+});
+
 test('LLM tool-call injection block', () => {
   const result = analyzeEvent({
     type: 'llm',

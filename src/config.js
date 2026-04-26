@@ -5,6 +5,11 @@ import { defaultRules } from './policy/default-rules.js';
 export const DEFAULT_CONFIG = {
   dataDir: '.404gent',
   failClosed: false,
+  mode: 'enforce',
+  companyId: 'default',
+  vectorStore: {
+    provider: 'jsonl'
+  },
   blockSeverities: ['critical', 'high'],
   llm: {
     enabled: false,
@@ -23,6 +28,15 @@ function mergeConfig(base, override) {
     ...override,
     rules: Object.hasOwn(override, 'rules') ? override.rules : base.rules
   };
+}
+
+export function applyCompanyProfile(config, companyId) {
+  const profile = config.companyProfiles?.[companyId];
+  if (!profile) {
+    return { ...config, companyId };
+  }
+
+  return mergeConfig({ ...config, companyId }, profile);
 }
 
 export async function loadConfig({ configPath } = {}) {

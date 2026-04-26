@@ -23,7 +23,14 @@ test('creates vector document from normalized report', () => {
 test('writes vector documents as jsonl', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), '404gent-vectors-'));
   const report = analyzeEvent({ type: 'image', text: 'hidden instruction for ocr prompt' });
-  await appendVectorDocument(report, { dataDir });
+  const result = await appendVectorDocument(report, { dataDir });
+  assert.equal(result.skipped, false);
   const raw = await readFile(join(dataDir, 'vectors.jsonl'), 'utf8');
   assert.match(raw, /"type":"image"/);
+});
+
+test('skips unsupported vector store providers', async () => {
+  const report = analyzeEvent({ type: 'prompt', text: 'hello' });
+  const result = await appendVectorDocument(report, { vectorStore: { provider: 'qdrant' } });
+  assert.deepEqual(result, { skipped: true, provider: 'qdrant', reason: 'provider_not_configured' });
 });
