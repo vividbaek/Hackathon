@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 import { loadConfig } from './config.js';
-import { scanText } from './policy/engine.js';
+import { mergeReports, scanText } from './policy/engine.js';
 import { appendAuditEvent } from './audit.js';
 import { updateState } from './state.js';
 import { appendVectorDocument } from './vector-store.js';
+import { createLlmProvider, shouldReviewWithLlm } from './providers/llm.js';
+import { highestSeverity } from './policy/severity.js';
 
 const HELP = `404gent - Terminal-first guardrails for AI coding agents in cmux.
 
@@ -89,7 +91,18 @@ export async function main(argv = process.argv.slice(2)) {
     return 2;
   }
 
-  const result = scanText({ surface, text, config });
+  let result = scanText({ surface, text, config });
+  if (shouldReviewWithLlm(result, config)) {
+    const llmReport = await createLlmProvider(config).evaluate(result);
+    const merged = mergeReports(result, llmReport, config);
+    result = {
+      ...merged,
+      surface,
+      text: String(text ?? ''),
+      severity: merged.findings.length > 0 ? highestSeverity(merged.findings) : 'low',
+      scannedAt: result.scannedAt
+    };
+  }
   await appendAuditEvent(result, config);
   await appendVectorDocument(result, config);
   await updateState(result, config);

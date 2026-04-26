@@ -1,6 +1,11 @@
 {
   "dataDir": ".404gent",
   "llm": {
-    "provider": "mock"
+    "enabled": true,
+    "provider": "mock",
+    "response": {
+      "skipped": false,
+      "findings": []
+    }
   }
 }
