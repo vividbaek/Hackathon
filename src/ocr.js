@@ -5,6 +5,9 @@ import sharp from 'sharp';
 import { writeFile, unlink, mkdir } from 'node:fs/promises';
 import path, { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { readFile } from 'node:fs/promises';
+import { detectAndDecodeQR } from './utils/qr-processor.js';
+import * as pdfjs from 'pdfjs-dist';
 
 /**
  * Tesseract Engine Implementation
@@ -92,23 +95,26 @@ async function recognizeWithEasyOcr(buffer, cropInfo) {
 /**
  * Main Standardized Pipeline
  */
-export async function scanStandardized(inputPath, targetWidth = 2000, options = { invert: true }) {
+export async function scanStandardized(inputSource, targetWidth = 2000, options = { invert: true }) {
   // 1. Create a normalized master buffer
-  const normalizedBuffer = await sharp(inputPath, { density: 300 })
+  const normalizedBuffer = await sharp(inputSource, { density: 300 })
     .resize({ width: targetWidth })
     .flatten({ background: { r: 255, g: 255, b: 255 } })
     .png()
     .toBuffer();
 
   const metadata = await sharp(normalizedBuffer).metadata();
-  const rows = 2, cols = 2, factor = 2;
+  const rows = 2;
+  const cols = 2;
+  const factor = 4; // Increased from 2 to 4 for extreme tiny text detection
   const gridCrops = await processor.gridScaleUp(normalizedBuffer, rows, cols, factor, targetWidth);
   
   const allResults = [];
   const cellW = Math.floor(metadata.width / cols);
   const cellH = Math.floor(metadata.height / rows);
 
-  console.log(`Processing ${inputPath} with standardized pipeline...`);
+  const sourceLabel = Buffer.isBuffer(inputSource) ? 'Buffer' : inputSource;
+  console.log(`Processing ${sourceLabel} with standardized pipeline...`);
   
   // Decide which versions of the image to scan (Multi-pass Attack Detection)
   const buffersToScan = [
@@ -136,6 +142,11 @@ export async function scanStandardized(inputPath, targetWidth = 2000, options = 
 
   const normalResults = [];
   const extremeResults = [];
+  const qrAttacks = [];
+
+  // Pass 0: Initial QR Scan on main buffer
+  const mainQr = await detectAndDecodeQR(normalizedBuffer);
+  qrAttacks.push(...mainQr.map(q => ({ ...q, source: 'qr_main' })));
 
   for (const { buffer, label } of buffersToScan) {
     console.log(` -> Processing [${label}] version...`);
@@ -143,8 +154,9 @@ export async function scanStandardized(inputPath, targetWidth = 2000, options = 
     
     // Scan whole image
     const wholeWords = await recognizeWithTesseract(buffer, { left: 0, top: 0, factor: 1 });
-    if (isExtreme) extremeResults.push(...wholeWords);
-    else normalResults.push(...wholeWords);
+    const wholeWordsWithSource = wholeWords.map(w => ({ ...w, source: label }));
+    if (isExtreme) extremeResults.push(...wholeWordsWithSource);
+    else normalResults.push(...wholeWordsWithSource);
 
     // Scan grid crops
     for (const crop of gridCrops) {
@@ -163,39 +175,145 @@ export async function scanStandardized(inputPath, targetWidth = 2000, options = 
       }
       
       const words = await recognizeWithTesseract(cropBuffer, { left, top, factor });
-      if (isExtreme) extremeResults.push(...words);
-      else normalResults.push(...words);
+      const wordsWithSource = words.map(w => ({ ...w, source: label }));
+      if (isExtreme) extremeResults.push(...wordsWithSource);
+      else normalResults.push(...wordsWithSource);
     }
+  }
+
+  // Pass 0.1: QR Scan on original crops (optimized)
+  for (const crop of gridCrops) {
+    const left = crop.col * cellW;
+    const top = crop.row * cellH;
+    const cropQr = await detectAndDecodeQR(crop.buffer);
+    qrAttacks.push(...cropQr.map(q => ({
+      ...q,
+      source: `qr_crop_${crop.row}_${crop.col}`,
+      bbox: {
+        x: Math.round((q.bbox.x / factor) + left),
+        y: Math.round((q.bbox.y / factor) + top),
+        w: Math.round(q.bbox.w / factor),
+        h: Math.round(q.bbox.h / factor)
+      }
+    })));
   }
 
   // Helper to de-duplicate and match
   const deduplicate = (list) => {
-    return Array.from(new Set(list.map(w => JSON.stringify({ text: w.text.trim().toLowerCase(), x: Math.round(w.bbox.x/10), y: Math.round(w.bbox.y/10) }))))
-      .map(s => {
-        const p = JSON.parse(s);
-        return list.find(w => w.text.trim().toLowerCase() === p.text && Math.round(w.bbox.x/10) === p.x && Math.round(w.bbox.y/10) === p.y);
-      })
-      .filter(w => w.text.length > 1);
+    const seen = new Map();
+    
+    list.forEach(w => {
+      const key = `${w.text.trim().toLowerCase()}_${Math.round(w.bbox.x/10)}_${Math.round(w.bbox.y/10)}`;
+      if (!seen.has(key)) {
+        seen.set(key, w);
+      } else {
+        // Optional: Combine sources if found in multiple passes
+        const existing = seen.get(key);
+        if (existing.source !== w.source && !existing.source.includes(w.source)) {
+          existing.source = `${existing.source}, ${w.source}`;
+        }
+      }
+    });
+
+    return Array.from(seen.values()).filter(w => w.text.length > 1);
   };
 
   const cleanNormal = deduplicate(normalResults);
   const cleanExtreme = deduplicate(extremeResults);
 
-  // Find "Hidden" text: Found in extreme but NOT in normal
-  const hiddenText = cleanExtreme.filter(ext => {
-    // Check if any normal word matches this extreme word spatially and textually
+  // Find "Hidden" text candidate words
+  const hiddenCandidateWords = cleanExtreme.filter(ext => {
     const isFoundInNormal = cleanNormal.some(norm => {
       const textMatch = norm.text.trim().toLowerCase() === ext.text.trim().toLowerCase();
       const dist = Math.sqrt(Math.pow(norm.bbox.x - ext.bbox.x, 2) + Math.pow(norm.bbox.y - ext.bbox.y, 2));
-      return textMatch && dist < 30; // Within 30px distance
+      return textMatch && dist < 30;
     });
     return !isFoundInNormal;
   });
 
+  // --- 1. Group Hidden Words into Lines/Sentences ---
+  const groups = [];
+  if (hiddenCandidateWords.length > 0) {
+    const sorted = [...hiddenCandidateWords].sort((a, b) => (a.bbox.y - b.bbox.y) || (a.bbox.x - b.bbox.x));
+    let currentGroup = [sorted[0]];
+    for (let i = 1; i < sorted.length; i++) {
+      const last = currentGroup[currentGroup.length - 1];
+      const curr = sorted[i];
+      const yDiff = Math.abs(curr.bbox.y - last.bbox.y);
+      const xDist = curr.bbox.x - (last.bbox.x + last.bbox.w);
+      if (yDiff < 15 && xDist < 60) currentGroup.push(curr);
+      else { groups.push(currentGroup); currentGroup = [curr]; }
+    }
+    groups.push(currentGroup);
+  }
+
+  // --- 2. Score Each Line ---
+  const scoredLines = groups.map(group => {
+    const minX = Math.min(...group.map(w => w.bbox.x));
+    const minY = Math.min(...group.map(w => w.bbox.y));
+    const maxX = Math.max(...group.map(w => w.bbox.x + w.bbox.w));
+    const maxY = Math.max(...group.map(w => w.bbox.y + w.bbox.h));
+    const text = group.map(w => w.text).join(' ');
+    const sources = Array.from(new Set(group.flatMap(w => w.source.split(', '))));
+    const avgConf = group.reduce((acc, w) => acc + w.conf, 0) / group.length;
+    const avgHeight = (maxY - minY);
+
+    let score = 20; // Lowered base score
+    
+    // Length Penalty (Filter out tiny fragments like 'ing', 'NN')
+    if (text.length < 5) score -= 30;
+    else if (text.length > 10) score += 15;
+
+    // Source analysis
+    if (sources.includes('high_clahe')) score += 10;
+    if (sources.includes('low_threshold')) score += 10;
+    if (sources.length >= 2) score += 20;
+
+    // Location analysis (Is in margin?)
+    const isMargin = minX < 100 || maxX > (metadata.width - 100) || minY < 100 || maxY > (metadata.height - 100);
+    if (isMargin) score += 15;
+    if (avgHeight < 25) score += 20; // Strong tiny text signal
+
+    // Confidence
+    if (avgConf > 80) score += 10;
+    if (avgConf < 50) score -= 25; // Harsher penalty for low confidence
+
+    // Content analysis (The most important factor)
+    const containsUrl = /http|https|\.com|\.test|\.sh|curl|bash|admin|root|override|inject|exploit/i.test(text);
+    if (containsUrl) score += 40; // Increased bonus for clear attack patterns
+    if (/[A-Z]{3,}/.test(text)) score += 10;
+    if (/=|:|\[|\]|\/|\.|\-/.test(text)) score += 10;
+
+    // Proximity Penalty: Check if it's too close to normal visible text
+    const isCloseToNormal = cleanNormal.some(norm => {
+      const dist = Math.sqrt(Math.pow(norm.bbox.x - minX, 2) + Math.pow(norm.bbox.y - minY, 2));
+      return dist < 50; // Within 50px of visible text is likely a halo/ghost
+    });
+    if (isCloseToNormal) score -= 30;
+
+    return {
+      x: minX, y: minY, w: maxX - minX, h: maxY - minY,
+      text, sources, score, avgConf
+    };
+  });
+
+  // Strict Threshold: Only high confidence attacks
+  const filteredAttacks = scoredLines.filter(line => line.score >= 85);
+
+  // --- 3. Merge QR Attacks ---
+  const finalAttacks = [
+    ...filteredAttacks.map(a => ({ ...a, type: 'hidden_text' })),
+    ...qrAttacks.map(q => ({
+      x: q.bbox.x, y: q.bbox.y, w: q.bbox.w, h: q.bbox.h,
+      text: q.text, sources: [q.source], score: q.score, avgConf: 100,
+      type: 'qr_code', category: q.category
+    }))
+  ];
+
   return {
     resolution: { width: metadata.width, height: metadata.height },
     normalWords: cleanNormal,
-    hiddenWords: hiddenText
+    hiddenAttacks: finalAttacks.sort((a, b) => b.score - a.score)
   };
 }
 
@@ -223,16 +341,44 @@ async function runSelfTest() {
 
 // CLI Execution
 if (process.argv[1].endsWith('ocr.js')) {
-  const imgPath = process.argv[2];
-  if (!imgPath) {
-    console.log('Usage: node src/ocr.js <image_path>');
+  const filePath = process.argv[2];
+  if (!filePath) {
+    console.log('Usage: node src/ocr.js <image_or_pdf_path>');
     process.exit(1);
   }
 
-  runSelfTest().then(alive => {
+  runSelfTest().then(async alive => {
     if (!alive) process.exit(1);
     
-    scanStandardized(imgPath).then(data => {
+    let inputSource = filePath;
+    
+    // Handle PDF by converting first page to image
+    if (filePath.toLowerCase().endsWith('.pdf')) {
+      console.log(`📄 PDF detected: ${filePath}. Extracting first page...`);
+      try {
+        const data = new Uint8Array(await readFile(filePath));
+        const loadingTask = pdfjs.getDocument({ data, verbosity: 0 });
+        const pdf = await loadingTask.promise;
+        const page = await pdf.getPage(1);
+        const viewport = page.getViewport({ scale: 2.0 });
+        
+        // We use canvas to render the PDF page to a buffer
+        const canvas = (await import('canvas')).default.createCanvas(viewport.width, viewport.height);
+        const context = canvas.getContext('2d');
+        
+        await page.render({
+          canvasContext: context,
+          viewport: viewport
+        }).promise;
+        
+        inputSource = canvas.toBuffer('image/png');
+      } catch (err) {
+        console.error('Failed to process PDF:', err);
+        process.exit(1);
+      }
+    }
+
+    scanStandardized(inputSource).then(data => {
       console.log('\n' + '='.repeat(50));
       console.log('📊 OCR ANALYSIS REPORT');
       console.log('='.repeat(50));
@@ -241,30 +387,39 @@ if (process.argv[1].endsWith('ocr.js')) {
       console.log('\n[1] NORMAL VISIBLE TEXT:');
       if (data.normalWords.length === 0) console.log(' (None)');
       data.normalWords.forEach(w => {
-        if (w.conf > 60) console.log(` - ${w.text} (${w.conf}%)`);
+        if (w.conf > 60) console.log(` - ${w.text} (${w.conf}%) [source: ${w.source}]`);
       });
 
       console.log('\n' + '!'.repeat(50));
-      console.log('🚨 HIDDEN ATTACK DETECTION (Extreme Processing Only)');
+      console.log('🚨 HIDDEN ATTACK DETECTION (Risk Score >= 85)');
       console.log('!'.repeat(50));
-      if (data.hiddenWords.length === 0) {
-        console.log(' ✅ No hidden text detected.');
+      
+      if (data.hiddenAttacks.length === 0) {
+        console.log(' ✅ No high-risk hidden text or QR attacks detected.');
       } else {
-        data.hiddenWords.forEach(w => {
-          console.log(` 🚩 DETECTED: "${w.text}" (conf: ${w.conf}%) at x:${w.bbox.x}, y:${w.bbox.y}`);
+        data.hiddenAttacks.forEach(line => {
+          const typeLabel = line.type === 'qr_code' ? `[QR: ${line.category}]` : '[HIDDEN TEXT]';
+          console.log(` [Score: ${line.score}] 🚩 ${typeLabel} "${line.text}"`);
+          console.log(`    -> Sources: ${line.sources.join(', ')}`);
+          console.log(`    -> Location: x:${line.x}, y:${line.y}, h:${line.h}`);
+          if (line.type !== 'qr_code') {
+            console.log(`    -> Confidence: ${Math.round(line.avgConf)}%\n`);
+          } else {
+            console.log('');
+          }
         });
       }
       console.log('!'.repeat(50) + '\n');
 
-      // Visualization (Only for Hidden Attacks)
+      // Visualization (Only for Scored Attacks)
       const outputDir = 'examples/detected';
       const fileName = path.basename(imgPath, path.extname(imgPath));
       const outputPath = path.join(outputDir, `${fileName}_detected.png`);
 
       mkdir(outputDir, { recursive: true })
-        .then(() => processor.drawBoundingBoxes(imgPath, data.hiddenWords))
+        .then(() => processor.drawBoundingBoxes(imgPath, data.hiddenAttacks))
         .then(vizBuffer => writeFile(outputPath, vizBuffer))
-        .then(() => console.log(`✅ Visualized result (HIDDEN ONLY) saved to: ${outputPath}`))
+        .then(() => console.log(`✅ Visualized result saved to: ${outputPath}`))
         .catch(err => console.error('Failed to save visualization:', err));
 
     }).catch(err => {
