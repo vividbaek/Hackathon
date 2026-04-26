@@ -8,6 +8,7 @@ import { createLlmProvider, shouldReviewWithLlm } from './providers/llm.js';
 import { encodeImageFile, createVisionProviderFromConfig } from './providers/vision-llm.js';
 import { highestSeverity } from './policy/severity.js';
 import { runGuardedCommand } from './runner.js';
+import { createAgentHandoff } from './harness.js';
 
 const HELP = `404gent - Terminal-first guardrails for AI coding agents in cmux.
 
@@ -19,6 +20,7 @@ Usage:
   404gent scan-image <vlm-or-ocr-text>
   404gent scan-image --file <image-path>
   404gent scan-llm <text>
+  404gent agent --role <qa|backend|security> -- <task>
   404gent run -- <command> [args...]
   404gent doctor
   404gent tower
@@ -26,12 +28,13 @@ Usage:
 Options:
   --config <path>   Load a JSON config file.
   --file <path>     Image file path for scan-image (enables Claude Vision analysis).
+  --role <role>     Agent harness role. Defaults to qa.
   --json            Print machine-readable JSON.
 `;
 
 function parseArgs(argv) {
   const args = [...argv];
-  const options = { json: false, configPath: undefined, filePath: undefined };
+  const options = { json: false, configPath: undefined, filePath: undefined, role: 'qa' };
   const positionals = [];
   const separatorIndex = args.indexOf('--');
   let passthrough = [];
@@ -49,6 +52,8 @@ function parseArgs(argv) {
       options.configPath = args.shift();
     } else if (arg === '--file') {
       options.filePath = args.shift();
+    } else if (arg === '--role') {
+      options.role = args.shift() ?? 'qa';
     } else {
       positionals.push(arg);
     }
@@ -120,6 +125,19 @@ export async function main(argv = process.argv.slice(2)) {
       recordReport
     });
     return result.exitCode;
+  }
+
+  if (command === 'agent') {
+    const task = passthrough.length > 0 ? passthrough.join(' ') : text;
+    const handoff = createAgentHandoff({ role: options.role, task, config });
+    await recordReport(handoff.promptReport);
+    await recordReport(handoff.handoffReport);
+    if (options.json) {
+      console.log(JSON.stringify(handoff, null, 2));
+    } else {
+      console.log(handoff.brief);
+    }
+    return handoff.promptReport.decision === 'block' ? 1 : 0;
   }
 
   const surfaces = {
