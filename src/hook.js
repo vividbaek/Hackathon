@@ -23,6 +23,8 @@ const { scanText } = await import('./policy/engine.js');
 const { appendAuditEvent } = await import('./audit.js');
 const { updateState } = await import('./state.js');
 const { appendVectorDocument } = await import('./vector-store.js');
+const { createVisionProvider } = await import('./providers/vision-llm.js');
+const { createGoogleVisionProvider } = await import('./providers/google-vision.js');
 
 function readStdin() {
   return new Promise((resolve, reject) => {
@@ -36,9 +38,50 @@ function readStdin() {
   });
 }
 
+// Extract base64 image blocks from UserPromptSubmit content (multimodal prompts)
+function extractImages(input) {
+  const content = input.content ?? input.prompt;
+  if (!Array.isArray(content)) return [];
+
+  return content
+    .filter((block) => block?.type === 'image')
+    .map((block) => {
+      const src = block.source ?? block;
+      return {
+        base64: src.data ?? src.base64 ?? '',
+        mediaType: src.media_type ?? src.mediaType ?? 'image/png'
+      };
+    })
+    .filter((img) => img.base64.length > 0);
+}
+
+function createVisionProviderForConfig(config) {
+  const llmConfig = config.llm ?? {};
+  const provider = llmConfig.visionProvider ?? llmConfig.provider ?? 'anthropic';
+
+  if (provider === 'google') {
+    const apiKey = process.env[llmConfig.googleApiKeyEnv ?? 'GOOGLE_API_KEY'];
+    return createGoogleVisionProvider({
+      apiKey,
+      model: llmConfig.googleVisionModel ?? 'gemini-2.0-flash'
+    });
+  }
+
+  const apiKey = process.env[llmConfig.apiKeyEnv ?? 'ANTHROPIC_API_KEY'];
+  return createVisionProvider({
+    apiKey,
+    model: llmConfig.visionModel ?? llmConfig.model ?? 'claude-opus-4-6'
+  });
+}
+
 function extractText(hookEvent, input) {
   if (hookEvent === 'UserPromptSubmit') {
-    return { surface: 'prompt', text: input.content ?? '' };
+    // Claude Code sends `prompt` (not `content`) for UserPromptSubmit
+    const content = input.content;
+    const text = Array.isArray(content)
+      ? content.filter((b) => b?.type === 'text').map((b) => b.text).join('\n')
+      : (input.prompt ?? input.content ?? '');
+    return { surface: 'prompt', text };
   }
 
   if (hookEvent === 'PreToolUse' && input.tool_name === 'Bash') {
@@ -78,8 +121,9 @@ async function main() {
 
   const { surface, text } = extracted;
 
-  // 빈 텍스트 → 스캔 불필요
-  if (!text.trim()) process.exit(0);
+  // 빈 텍스트이고 이미지도 없으면 스캔 불필요
+  const hasImages = hookEvent === 'UserPromptSubmit' && extractImages(input).length > 0;
+  if (!text.trim() && !hasImages) process.exit(0);
 
   let config;
   try {
@@ -105,6 +149,46 @@ async function main() {
       cwd: input.cwd
     }
   });
+
+  // Vision scan: check for prompt injections embedded in uploaded images
+  const extraFindings = [];
+  if (hookEvent === 'UserPromptSubmit') {
+    const images = extractImages(input);
+    if (images.length > 0) {
+      try {
+        const visionProvider = createVisionProviderForConfig(config);
+        for (const img of images) {
+          const visionResult = await visionProvider.analyzeImage(img);
+          if (!visionResult.skipped) {
+            extraFindings.push(...visionResult.findings);
+            // Also run text-rule scan on any hidden prompts extracted from the image
+            for (const hiddenPrompt of visionResult.hiddenPrompts) {
+              const hiddenScan = scanText({
+                surface: 'prompt',
+                text: hiddenPrompt,
+                config,
+                source: 'vision-hidden-prompt'
+              });
+              extraFindings.push(...hiddenScan.findings);
+            }
+          }
+        }
+      } catch {
+        // Vision analysis error → fail-open, do not block
+      }
+    }
+  }
+
+  // Merge vision findings into result
+  if (extraFindings.length > 0) {
+    result.findings.push(...extraFindings);
+    const blockSeverities = config.blockSeverities ?? ['critical', 'high'];
+    if (result.findings.some((f) => blockSeverities.includes(f.severity))) {
+      result.decision = 'block';
+    } else if (result.decision === 'allow') {
+      result.decision = 'warn';
+    }
+  }
 
   // Record to audit log, vector store, state
   try {

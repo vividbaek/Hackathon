@@ -1,0 +1,12 @@
+{
+  "mode": "enforce",
+  "blockSeverities": ["critical", "high"],
+  "llm": {
+    "enabled": true,
+    "provider": "anthropic",
+    "model": "claude-haiku-4-5-20251001",
+    "apiKeyEnv": "ANTHROPIC_API_KEY",
+    "reviewTypes": ["prompt", "image", "vision_observation", "llm"],
+    "reviewDecisions": ["allow", "warn"]
+  }
+}
