@@ -143,6 +143,40 @@ export function createAgentHandoff({ role = 'qa', task = '', config = {}, sessio
   };
 }
 
+/**
+ * Scan agent A's output before it becomes agent B's task.
+ * Blocks cross-agent context poisoning at the handoff boundary.
+ *
+ * Returns { blocked, pipeReport, handoff }
+ *   blocked=true  → output was dangerous; do not forward to next agent
+ *   blocked=false → handoff object is safe to use
+ */
+export function pipeToAgent({ fromRole, toRole, outputText, config = {}, sessionId, companyId }) {
+  const pipeReport = scanText({
+    surface: 'llm',
+    text: String(outputText ?? ''),
+    config,
+    source: 'agent-pipe',
+    agentId: `agent-${fromRole}`,
+    meta: { fromRole, toRole, sessionId }
+  });
+
+  if (pipeReport.decision === 'block') {
+    return { blocked: true, pipeReport, handoff: null };
+  }
+
+  const task = `[Forwarded output from ${fromRole} agent]\n\n${outputText}`;
+  const handoff = createAgentHandoff({
+    role: toRole,
+    task,
+    config,
+    sessionId,
+    companyId: companyId ?? config.companyId
+  });
+
+  return { blocked: false, pipeReport, handoff };
+}
+
 export async function saveAgentHandoff(handoff, config = {}) {
   const dataDir = config.dataDir ?? '.404gent';
   const handoffDir = join(dataDir, 'handoffs');

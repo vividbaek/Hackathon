@@ -8,7 +8,8 @@ import { createLlmProvider, shouldReviewWithLlm } from './providers/llm.js';
 import { encodeImageFile, createVisionProviderFromConfig } from './providers/vision-llm.js';
 import { highestSeverity } from './policy/severity.js';
 import { runGuardedCommand } from './runner.js';
-import { createAgentHandoff, saveAgentHandoff } from './harness.js';
+import { createAgentHandoff, saveAgentHandoff, pipeToAgent } from './harness.js';
+import { runTower } from './tower.js';
 
 const HELP = `404gent - Terminal-first guardrails for AI coding agents in cmux.
 
@@ -21,6 +22,7 @@ Usage:
   404gent scan-image --file <image-path>
   404gent scan-llm <text>
   404gent agent --role <qa|backend|security> -- <task>
+  404gent pipe --role <from> --to <to> -- <output-text>
   404gent run -- <command> [args...]
   404gent doctor
   404gent tower
@@ -35,7 +37,7 @@ Options:
 
 function parseArgs(argv) {
   const args = [...argv];
-  const options = { json: false, configPath: undefined, filePath: undefined, role: 'qa', companyId: undefined };
+  const options = { json: false, configPath: undefined, filePath: undefined, role: 'qa', to: undefined, companyId: undefined };
   const positionals = [];
   const separatorIndex = args.indexOf('--');
   let passthrough = [];
@@ -55,6 +57,8 @@ function parseArgs(argv) {
       options.filePath = args.shift();
     } else if (arg === '--role') {
       options.role = args.shift() ?? 'qa';
+    } else if (arg === '--to') {
+      options.to = args.shift();
     } else if (arg === '--company') {
       options.companyId = args.shift();
     } else {
@@ -138,7 +142,7 @@ export async function main(argv = process.argv.slice(2)) {
   }
 
   if (command === 'tower') {
-    console.log('404gent tower: runtime guardrail console is not implemented yet.');
+    await runTower(config);
     return 0;
   }
 
@@ -169,6 +173,44 @@ export async function main(argv = process.argv.slice(2)) {
       console.log(`\nSaved handoff: ${paths.rolePath}`);
     }
     return handoff.promptReport.decision === 'block' ? 1 : 0;
+  }
+
+  if (command === 'pipe') {
+    const fromRole   = options.role;
+    const toRole     = options.to;
+    const outputText = passthrough.length > 0 ? passthrough.join(' ') : text;
+
+    if (!toRole) {
+      console.error('pipe requires --to <role>  (e.g. --to backend)');
+      return 2;
+    }
+
+    const result = pipeToAgent({ fromRole, toRole, outputText, config, companyId: config.companyId });
+    await recordReport(result.pipeReport);
+
+    if (result.blocked) {
+      if (options.json) {
+        console.log(JSON.stringify({ blocked: true, pipeReport: result.pipeReport }, null, 2));
+      } else {
+        console.error(`\n🚫 Pipe BLOCKED (${fromRole} → ${toRole}): cross-agent contamination detected.`);
+        for (const f of result.pipeReport.findings) {
+          console.error(`  [${f.severity}] ${f.id}: ${f.rationale}`);
+        }
+      }
+      return 1;
+    }
+
+    const paths = await saveAgentHandoff(result.handoff, config);
+    await recordReport(result.handoff.promptReport);
+    await recordReport(result.handoff.handoffReport);
+
+    if (options.json) {
+      console.log(JSON.stringify({ blocked: false, pipeReport: result.pipeReport, handoff: result.handoff, paths }, null, 2));
+    } else {
+      console.log(result.handoff.brief);
+      console.log(`\nPiped: ${fromRole} → ${toRole}  (saved: ${paths.rolePath})`);
+    }
+    return 0;
   }
 
   const surfaces = {

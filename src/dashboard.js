@@ -223,7 +223,9 @@ function collectTimeline(events, candidates) {
 
 function buildAgentFlows(events) {
   const ROLES = ['qa', 'backend', 'security'];
-  const STAGE_ORDER = ['prompt', 'llm', 'command', 'output'];
+  const STAGE_ORDER = ['image', 'vision_observation', 'prompt', 'llm', 'command', 'output'];
+  const RECENT_MS = 5 * 60 * 1000;
+  const now = Date.now();
   return ROLES.map(role => {
     const agentId = `agent-${role}`;
     const agentEvents = events.filter(e => (e.event?.agentId ?? '') === agentId);
@@ -233,13 +235,25 @@ function buildAgentFlows(events) {
       if (!bySession[sid]) bySession[sid] = [];
       bySession[sid].push(ev);
     }
-    let latestSession = [], latestTime = '';
+    const sessionCount = Object.keys(bySession).length;
+
+    // Pick the most critical session (block first, then most recent)
+    let chosenSession = [], chosenTime = '';
+    let hasBlock = false;
     for (const evts of Object.values(bySession)) {
       const t = evts.reduce((m, e) => { const ts = e.timestamp ?? e.scannedAt ?? ''; return ts > m ? ts : m; }, '');
-      if (t > latestTime) { latestTime = t; latestSession = evts; }
+      const sessionBlocked = evts.some(e => e.decision === 'block');
+      if (!hasBlock && sessionBlocked) { hasBlock = true; chosenSession = evts; chosenTime = t; }
+      else if (hasBlock === sessionBlocked && t > chosenTime) { chosenSession = evts; chosenTime = t; }
     }
+
+    // Count sessions active in last 5 min
+    const recentSessionCount = Object.values(bySession).filter(evts =>
+      evts.some(e => now - Date.parse(e.timestamp ?? e.scannedAt ?? '') < RECENT_MS)
+    ).length;
+
     const stageMap = {};
-    for (const ev of latestSession) {
+    for (const ev of chosenSession) {
       const surface = ev.surface ?? ev.event?.type ?? 'unknown';
       if (STAGE_ORDER.includes(surface)) {
         if (!stageMap[surface] || ev.decision === 'block') {
@@ -256,7 +270,9 @@ function buildAgentFlows(events) {
     const overallDecision = blockStage ? 'block'
       : stages.some(s => s.decision === 'warn') ? 'warn'
       : stages.length > 0 ? 'allow' : 'idle';
-    return { role, agentId, overallDecision, stages, blockStage: blockStage?.surface ?? null, eventCount: latestSession.length, lastSeen: latestTime || null };
+    return { role, agentId, overallDecision, stages, blockStage: blockStage?.surface ?? null,
+      eventCount: chosenSession.length, lastSeen: chosenTime || null,
+      sessionCount, recentSessionCount };
   });
 }
 
@@ -985,10 +1001,12 @@ const ROLE_META={
   security:{label:'Agent 3 · Security',  icon:'🛡',  sub:'Security / Analyst'}
 };
 const STAGE_META={
-  prompt: {icon:'📝', label:'Prompt 스캔'},
-  llm:    {icon:'🤖', label:'LLM 핸드오프'},
-  command:{icon:'⚡', label:'Command 실행'},
-  output: {icon:'📤', label:'Output 검사'}
+  image:             {icon:'🖼', label:'Image 스캔'},
+  vision_observation:{icon:'👁', label:'Vision 분석'},
+  prompt:            {icon:'📝', label:'Prompt 스캔'},
+  llm:               {icon:'🤖', label:'LLM 핸드오프'},
+  command:           {icon:'⚡', label:'Command 실행'},
+  output:            {icon:'📤', label:'Output 검사'}
 };
 function renderAgentFlows(model){
   const flows=model.agentFlows||[];
@@ -1018,10 +1036,13 @@ function renderAgentFlows(model){
           (isBlock?'<div class="pf-block-detail"><code>'+h(ruleId)+'</code><div class="pf-rationale">'+h(rationale)+'</div></div>':'')+
         '</div>';
     }).join('');
+    const sessionBadge=flow.sessionCount>1
+      ?'<span title="'+flow.sessionCount+'개 세션 중 최우선(차단 우선) 세션 표시" style="font-size:10px;background:#e0e7ff;color:#4338ca;border-radius:4px;padding:1px 5px;margin-left:4px;">세션 '+flow.sessionCount+'개'+(flow.recentSessionCount>1?' · '+flow.recentSessionCount+' 활성':'')+'</span>'
+      :'';
     return '<div class="afc-col '+od+'" data-agent-id="'+flow.agentId+'">'+
       '<div class="afc-header">'+
         '<span class="afc-icon">'+m.icon+'</span>'+
-        '<div><div class="afc-name">'+h(m.label)+'</div><div class="afc-sub">'+h(m.sub)+'</div>'+(miniStats?'<div class="afc-mini-stats">'+miniStats+'</div>':'')+'</div>'+
+        '<div><div class="afc-name">'+h(m.label)+sessionBadge+'</div><div class="afc-sub">'+h(m.sub)+'</div>'+(miniStats?'<div class="afc-mini-stats">'+miniStats+'</div>':'')+'</div>'+
         '<span class="afc-status pill '+od+'">'+ST_LABEL[od]+'</span>'+
       '</div>'+
       '<div class="afc-pipeline">'+(stagesHtml||'<div class="afc-empty" style="padding:20px;font-size:12px;">미실행</div>')+'</div>'+
@@ -1144,10 +1165,27 @@ function renderAgentColumn(agentId,events,now,maxRows){
   const wn=ae.filter(e=>e.decision==='warn').length;
   const al=ae.filter(e=>e.decision==='allow').length;
   const borderCls=bk>0?'has-block':wn>0?'has-warn':'';
-  const shown=ae.slice(0,maxRows||15);
-  const rowsHtml=shown.length
-    ?shown.map(e=>renderEventRow(e,now)).join('')
-    :'<div class="hac-empty">이 에이전트의 이벤트가 없습니다.</div>';
+  const cap=maxRows||20;
+  const shown=ae.slice(0,cap);
+  let rowsHtml='';
+  if(!shown.length){
+    rowsHtml='<div class="hac-empty">이 에이전트의 이벤트가 없습니다.</div>';
+  } else {
+    const groups=groupByTimeWindow(shown,30);
+    for(const g of groups){
+      if(groups.length>1){
+        const gBk=g.events.filter(e=>e.decision==='block').length;
+        const gWn=g.events.filter(e=>e.decision==='warn').length;
+        rowsHtml+='<div class="tl-group-header" style="font-size:10px;padding:3px 8px;">'+
+          '<span>'+fmt(new Date(g.end).toISOString())+' ~ '+fmt(new Date(g.start).toISOString())+'</span>'+
+          '<span>'+g.events.length+'건</span>'+
+          (gBk?'<span class="tl-group-blocks">'+gBk+' 차단</span>':'')+
+          (gWn?'<span class="tl-group-warns">'+gWn+' 경고</span>':'')+
+        '</div>';
+      }
+      rowsHtml+=g.events.map(e=>renderEventRow(e,now)).join('');
+    }
+  }
   const moreBtn=ae.length>shown.length
     ?'<div class="hac-footer"><button onclick="document.querySelectorAll(\'[data-agent=&quot;'+agentId+'&quot;]\').forEach(b=>b.click())">+'+( ae.length-shown.length)+'건 더 보기</button></div>':'';
   return '<div class="hist-agent-col '+borderCls+'">'+
@@ -1180,7 +1218,7 @@ function renderHistory(model){
     const agents=['agent-qa','agent-backend','agent-security'];
     const unassigned=preFiltered.filter(e=>!agents.includes(e.event?.agentId??''));
     let html='<div class="hist-agent-grid">'+
-      agents.map(aid=>renderAgentColumn(aid,preFiltered,now,15)).join('')+
+      agents.map(aid=>renderAgentColumn(aid,preFiltered,now,20)).join('')+
     '</div>';
     if(unassigned.length){
       html+='<div style="margin-top:16px;"><div class="tl-group-header"><span>미분류 이벤트</span><span>'+unassigned.length+'건</span></div>';
@@ -1209,7 +1247,7 @@ function renderHistory(model){
   for(const g of groups){
     const gBlocks=g.events.filter(e=>e.decision==='block').length;
     const gWarns=g.events.filter(e=>e.decision==='warn').length;
-    html+='<div class="tl-group-header"><span>'+fmt(new Date(g.start).toISOString())+' ~ '+fmt(new Date(g.end).toISOString())+'</span>'+
+    html+='<div class="tl-group-header"><span>'+fmt(new Date(g.end).toISOString())+' ~ '+fmt(new Date(g.start).toISOString())+'</span>'+
       '<span>'+g.events.length+'건</span>'+
       (gBlocks?'<span class="tl-group-blocks">'+gBlocks+' 차단</span>':'')+
       (gWarns?'<span class="tl-group-warns">'+gWarns+' 경고</span>':'')+
