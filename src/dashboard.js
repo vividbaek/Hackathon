@@ -7,6 +7,7 @@ import { createVisionProviderFromConfig } from './providers/vision-llm.js';
 import { scanText, mergeReports } from './policy/engine.js';
 import { highestSeverity } from './policy/severity.js';
 import { recordReport } from './guard.js';
+import { preprocessImage } from './image-preprocess.js';
 
 const DEFAULT_PORT = 4040;
 const MAX_PORT = 4050;
@@ -99,7 +100,7 @@ function normalizeDashboardAgentId(value) {
 
 function agentFromSource(source) {
   const match = String(source ?? '').match(/^agent:([^:]+):os$/);
-  return match ? match[1] : '';
+  return match ? match[1] : null;
 }
 
 function dashboardAgentId(e) {
@@ -398,14 +399,15 @@ function buildAgentFlows(events) {
     });
   }
 
-  // Other LLM agent roles: keep existing single-flow logic
+  // Other LLM agent roles: only include if they have actual events
   for (const role of ROLES.filter(r => r !== 'runtime')) {
     const agentId = `agent-${role}`;
     const agentEvents = events.filter(e => dashboardAgentId(e) === agentId);
+    if (agentEvents.length === 0) continue;
     const flow = buildSessionFlow(agentEvents, STAGE_ORDER);
     flows.push({
       role, agentId, isPerSession: false,
-      ...flow, sessionCount: 1, recentSessionCount: agentEvents.length > 0 ? 1 : 0
+      ...flow, sessionCount: 1, recentSessionCount: 1
     });
   }
 
@@ -579,20 +581,49 @@ export function createDashboardServer({ dataDir = '.404gent' } = {}) {
         await writeFile(savedPath, filePart.data);
 
         const config = await getConfig();
+
+        // 1) OCR 멀티패스 (Tesseract: 극한대비, CLAHE, 엣지, 임계값) → 숨겨진 텍스트 추출
+        let ocrHiddenTexts = [];
+        let ocrAllTexts = [];
+        let preprocessResult = null;
+        try {
+          preprocessResult = await preprocessImage(savedPath, config, { quiet: true });
+          const detections = preprocessResult.preprocessed?.detections ?? [];
+          ocrHiddenTexts = detections.filter(d => d.kind === 'hidden_text').map(d => d.text);
+          ocrAllTexts = detections.map(d => d.text);
+        } catch (ocrErr) {
+          console.error('OCR preprocessing failed (continuing with Vision API):', ocrErr.message);
+        }
+
+        // 2) Vision API (Claude) → 이미지 직접 분석
         const visionProvider = createVisionProviderFromConfig(config);
         const base64 = filePart.data.toString('base64');
         const visionResult = await visionProvider.analyzeImage({ base64, mediaType });
 
+        // 3) 모든 소스에서 추출된 텍스트 결합 (공백+줄바꿈 양쪽으로 결합하여 패턴 매칭 향상)
+        const ocrHiddenSentence = ocrHiddenTexts.join(' ');
+        const ocrAllSentence = ocrAllTexts.join(' ');
         const scanInput = [
           ...visionResult.hiddenPrompts,
-          ...(visionResult.regions ?? []).map(r => r.text).filter(Boolean)
-        ].join('\n') || '';
+          ...(visionResult.regions ?? []).map(r => r.text).filter(Boolean),
+          ocrHiddenSentence,
+          ocrAllSentence
+        ].filter(Boolean).join('\n') || '';
 
+        const allHiddenPrompts = [
+          ...visionResult.hiddenPrompts,
+          ...(ocrHiddenSentence ? [ocrHiddenSentence] : [])
+        ].filter(Boolean);
+
+        // 4) 룰엔진 스캔
         let result = scanText({ surface: 'image', text: scanInput, config, evidence: {
-          hiddenPrompts: visionResult.hiddenPrompts, objects: visionResult.objects,
-          regions: visionResult.regions, imagePath: savedPath
+          hiddenPrompts: allHiddenPrompts, objects: visionResult.objects,
+          regions: visionResult.regions, imagePath: savedPath,
+          ocrDetections: preprocessResult?.preprocessed?.detections,
+          normalizedImagePath: preprocessResult?.normalizedPath
         }});
 
+        // 5) Vision 결과 병합
         if (!visionResult.skipped) {
           const merged = mergeReports(result, visionResult, config);
           result = { ...merged, surface: 'image', text: scanInput,
@@ -1343,9 +1374,9 @@ const STAGE_META={
   output:            {icon:'📤', label:'Output Guard'}
 };
 function renderAgentFlows(model){
-  const flows=model.agentFlows||[];
+  const flows=(model.agentFlows||[]).filter(f=>f.eventCount>0);
   const stats=model.agentStats||[];
-  if(!flows.length){return;}
+  if(!flows.length){document.getElementById('agent-flows').innerHTML='<div class="afc-empty" style="padding:32px;font-size:13px;color:var(--muted);">실행 중인 에이전트가 없습니다.</div>';return;}
   document.getElementById('agent-flows').innerHTML=flows.map(flow=>{
     const m=ROLE_META[flow.role]||{label:flow.role,icon:'🤖',sub:''};
     const od=flow.overallDecision||'idle';
@@ -1881,7 +1912,16 @@ function renderAll(model){
 // ── SSE 연결 ──────────────────────────────────────────────────────────────────
 const sse=new EventSource('/api/events');
 sse.onmessage=e=>{
-  try{renderAll(JSON.parse(e.data));}catch{}
+  try{
+    const data=JSON.parse(e.data);
+    if(data.error){
+      document.getElementById('updated').textContent='오류: '+data.error.slice(0,60);
+      return;
+    }
+    renderAll(data);
+  }catch(err){
+    document.getElementById('updated').textContent='렌더 오류: '+String(err).slice(0,60);
+  }
 };
 sse.onopen=()=>{ document.getElementById('live-dot').className='dot live'; };
 sse.onerror=()=>{

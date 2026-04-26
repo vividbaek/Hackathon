@@ -230,7 +230,7 @@ async function runSelfTest() {
 }
 
 // CLI Execution
-if (process.argv[1].endsWith('ocr.js')) {
+if (process.argv[1]?.endsWith('ocr.js')) {
   const imgPath = process.argv[2];
   if (!imgPath) {
     console.log('Usage: node src/ocr.js <image_path>');
